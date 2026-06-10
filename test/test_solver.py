@@ -46,7 +46,7 @@ def make_problem(seed, N, n, m, p, emode, regularized=False):
     M = rng.standard_normal((N, n, m)) * 0.3
     A = rng.standard_normal((N, n, n)) * 0.5
     B = rng.standard_normal((N, n, m))
-    D = rng.standard_normal((N, p, n)) * 0.5
+    D = rng.standard_normal((N + 1, p, n)) * 0.5
     if p > 0:
         D[0] = 0.0  # avoid the degenerate stage-0 state-constraint vs forced x0
     if emode == "zero":
@@ -66,20 +66,26 @@ def make_problem(seed, N, n, m, p, emode, regularized=False):
     for k in range(N):
         xt[k + 1] = A[k] @ xt[k] + B[k] @ ut[k] + c[k + 1]
     d = (
-        np.stack([D[k] @ xt[k] + E[k] @ ut[k] for k in range(N)])
+        np.concatenate(
+            [
+                np.stack([D[k] @ xt[k] + E[k] @ ut[k] for k in range(N)]),
+                (D[N] @ xt[N])[None],
+            ],
+            axis=0,
+        )
         if p > 0
-        else np.zeros((N, 0))
+        else np.zeros((N + 1, 0))
     )
     if regularized:
         Delta = np.stack([np.diag(0.02 + 0.01 * rng.random(n)) for _ in range(N + 1)])
         Sigma = (
-            np.stack([np.diag(0.03 + 0.02 * rng.random(p)) for _ in range(N)])
+            np.stack([np.diag(0.03 + 0.02 * rng.random(p)) for _ in range(N + 1)])
             if p > 0
-            else np.zeros((N, 0, 0))
+            else np.zeros((N + 1, 0, 0))
         )
     else:
         Delta = np.zeros((N + 1, n, n))
-        Sigma = np.zeros((N, p, p))
+        Sigma = np.zeros((N + 1, p, p))
     fac = FactorizationInputs(
         A=jnp.array(A),
         B=jnp.array(B),
@@ -113,7 +119,7 @@ def dense_primal(fac, si):
     N, n, m, p = A.shape[0], A.shape[1], B.shape[2], D.shape[1]
     nxu = N * (n + m) + n
     ny = (N + 1) * n
-    nt = nxu + ny + N * p
+    nt = nxu + ny + (N + 1) * p
     K = np.zeros((nt, nt))
     rhs = np.zeros(nt)
     for k in range(N):
@@ -146,6 +152,10 @@ def dense_primal(fac, si):
         K[ls : ls + p, ls : ls + p] = -Sigma[k]
         K[xk : xk + n, ls : ls + p] = D[k].T
         K[uk : uk + m, ls : ls + p] = E[k].T
+    ls = nxu + ny + N * p
+    K[ls : ls + p, xsN : xsN + n] = D[N]
+    K[ls : ls + p, ls : ls + p] = -Sigma[N]
+    K[xsN : xsN + n, ls : ls + p] = D[N].T
     for k in range(N):
         xs, us = k * (n + m), k * (n + m) + n
         rhs[xs : xs + n] = -q[k]
@@ -153,7 +163,7 @@ def dense_primal(fac, si):
     rhs[xsN : xsN + n] = -q[N]
     for k in range(N + 1):
         rhs[nxu + k * n : nxu + k * n + n] = -c[k]
-    for k in range(N):
+    for k in range(N + 1):
         rhs[nxu + ny + k * p : nxu + ny + k * p + p] = d[k]
     sv = np.linalg.lstsq(K, rhs, rcond=None)[0]
     x = np.stack(
@@ -216,9 +226,10 @@ def test_constraint_satisfaction(solver_name, solver, name, N, n, m, p, emode):
     sol = solver(fac, si)
     if p > 0:
         res = jax.vmap(lambda Dk, Ek, xk, uk, dk: Dk @ xk + Ek @ uk - dk)(
-            fac.D, fac.E, sol.X[:N], sol.U, si.d
+            fac.D[:N], fac.E, sol.X[:N], sol.U, si.d[:N]
         )
         np.testing.assert_allclose(res, 0, atol=ATOL)
+        np.testing.assert_allclose(fac.D[N] @ sol.X[N] - si.d[N], 0, atol=ATOL)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -323,14 +334,17 @@ def test_regularized_constraints_are_not_forced_exactly():
     fac, si = make_problem(102, 5, 3, 2, 2, "full", regularized=True)
     sol = factor_and_solve(fac, si)
     raw = jax.vmap(lambda Dk, xk, Ek, uk, dk: Dk @ xk + Ek @ uk - dk)(
-        fac.D, sol.X[:5], fac.E, sol.U, si.d
+        fac.D[:5], sol.X[:5], fac.E, sol.U, si.d[:5]
     )
+    raw_terminal = fac.D[5] @ sol.X[5] - si.d[5]
     np.testing.assert_allclose(
         raw,
-        jax.vmap(lambda Sigmak, Lk: Sigmak @ Lk)(fac.Sigma, sol.Lam),
+        jax.vmap(lambda Sigmak, Lk: Sigmak @ Lk)(fac.Sigma[:5], sol.Lam[:5]),
         atol=1e-8,
     )
+    np.testing.assert_allclose(raw_terminal, fac.Sigma[5] @ sol.Lam[5], atol=1e-8)
     assert float(jnp.max(jnp.abs(raw))) > 1e-8
+    assert float(jnp.max(jnp.abs(raw_terminal))) > 1e-8
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -348,12 +362,12 @@ def test_nontrivial_constraints_change_solution(solver_name, solver):
         Q=fac.Q,
         M=fac.M,
         R=fac.R,
-        D=jnp.zeros((5, 0, 3)),
+        D=jnp.zeros((6, 0, 3)),
         E=jnp.zeros((5, 0, 2)),
         Delta=fac.Delta,
-        Sigma=jnp.zeros((5, 0, 0)),
+        Sigma=jnp.zeros((6, 0, 0)),
     )
-    si0 = SolveInputs(q=si.q, r=si.r, c=si.c, d=jnp.zeros((5, 0)))
+    si0 = SolveInputs(q=si.q, r=si.r, c=si.c, d=jnp.zeros((6, 0)))
     sol_u = solver(fac0, si0)
     assert not np.allclose(sol_c.X, sol_u.X, atol=1e-2)
 

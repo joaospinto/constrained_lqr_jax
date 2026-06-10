@@ -4,8 +4,8 @@ All functions here are pure and reusable by both the sequential and parallel
 algorithms in :mod:`constrained_lqr_jax.solver`.
 
 The package supports optional dual regularization: dynamics use blocks
-``Delta_k`` and stagewise equality constraints use blocks ``Sigma_k``. Setting
-these blocks to zero recovers exact dynamics and exact stagewise constraints.
+``Delta_k`` and equality constraints use blocks ``Sigma_k``. Setting these
+blocks to zero recovers exact dynamics and exact equality constraints.
 
 The parallel backward pass is built on the *mixed-constraint interval value
 function* (IVF) — a uniform, fixed-dimension representation of the cost-to-go of
@@ -91,7 +91,9 @@ def mixed_ivf_base(inputs: FactorizationInputs, solve_inputs: SolveInputs):
         g = dk + Ek @ Rir
         return P, pv, Ao, Cc, co, Cyl, Cll, F, g
 
-    return jax.vmap(one)(A, B, Q[:N], M, R, D, E, Delta[1:], Sigma, q[:N], r, c[1:], d)
+    return jax.vmap(one)(
+        A, B, Q[:N], M, R, D[:N], E, Delta[1:], Sigma[:N], q[:N], r, c[1:], d[:N]
+    )
 
 
 def _schur_eliminate(H, h, n_outer):
@@ -204,12 +206,13 @@ def mixed_ivf_combine(left, right, n, p):
     return P, pv, A, C, cc, Cyl, Cll, F, g
 
 
-def mixed_ivf_fold_terminal(ivf, Q_N, q_N, n, p):
+def mixed_ivf_fold_terminal(ivf, Q_N, q_N, D_N, Sigma_N, d_N, n, p):
     """Fold the terminal cost into an IVF ``[k, N)`` to get the cost-to-go.
 
     Given a mixed IVF with entry ``x_k`` and exit ``x_N``, plus the terminal
-    cost ``½ x_Nᵀ Q_N x_N + q_Nᵀ x_N``, optimise out the exit ``x_N`` and the
-    dynamics dual ``y`` to obtain the constraint-carrying cost-to-go
+    cost ``½ x_Nᵀ Q_N x_N + q_Nᵀ x_N`` and terminal constraint
+    ``D_N x_N = d_N``, optimise out the exit ``x_N``, dynamics dual ``y`` and
+    terminal multiplier to obtain the constraint-carrying cost-to-go
     ``(P, p, F, Cll, g)`` of ``J_k`` as a function of ``x_k``.  Batched.
     """
     P, pv, A, C, c, Cyl, Cll, F, g = ivf
@@ -217,13 +220,14 @@ def mixed_ivf_fold_terminal(ivf, Q_N, q_N, n, p):
     I = jnp.broadcast_to(jnp.eye(n), batch + (n, n))
     tr = lambda X: jnp.swapaxes(X, -2, -1)
 
-    # outer o = [xk(n), λ(p)] ; interior w = [y(n), xN(n)]
+    # outer o = [xk(n), λ(p)] ; interior w = [y(n), xN(n), ν(p)]
     o = n + p
-    Dd = 3 * n + p
+    Dd = 3 * n + 2 * p
     xk = slice(0, n)
     ll = slice(n, n + p)
     y = slice(n + p, 2 * n + p)
     xN = slice(2 * n + p, 3 * n + p)
+    nu = slice(3 * n + p, 3 * n + 2 * p)
 
     H = jnp.zeros(batch + (Dd, Dd))
     h = jnp.zeros(batch + (Dd,))
@@ -254,6 +258,11 @@ def mixed_ivf_fold_terminal(ivf, Q_N, q_N, n, p):
     # terminal cost on xN
     setH(xN, xN, Q_N)
     seth(xN, q_N)
+    # terminal constraint on xN
+    setH(nu, xN, D_N)
+    setH(xN, nu, tr(D_N))
+    setH(nu, nu, -Sigma_N)
+    seth(nu, -d_N)
 
     Ht, ht = _schur_eliminate(H, h, o)
 
@@ -283,10 +292,11 @@ def compute_residual(
     The residual blocks (concatenated and flattened) are:
         stationarity in x:  Q x + M u + Aᵀ y₊ + Dᵀ λ + q - y,
         stationarity in u:  Mᵀ x + R u + Bᵀ y₊ + Eᵀ λ + r,
-        terminal x:         Q_N x_N + q_N - y_N,
+        terminal x:         Q_N x_N + q_N + D_Nᵀ λ_N - y_N,
         initial dynamics:   c₀ - x₀ - Delta₀ y₀,
         dynamics:           A x + B u + c₊ - x₊ - Delta₊ y₊,
-        constraints:        D x + E u - d - Sigma λ.
+        constraints:        D x + E u - d - Sigma λ,
+        terminal constraint: D_N x_N - d_N - Sigma_N λ_N.
     """
     A = factorization_inputs.A
     B = factorization_inputs.B
@@ -319,15 +329,15 @@ def compute_residual(
                 + Dk.T @ Lk
                 + qk
                 - Yk
-            )(Q[:N], X[:N], M, U, A, Y[:N], Y[1:], D, Lam, q[:N]).flatten(),
+            )(Q[:N], X[:N], M, U, A, Y[:N], Y[1:], D[:N], Lam[:N], q[:N]).flatten(),
             jax.vmap(
                 lambda Mk, Xk, Rk, Uk, Bk, Yk1, Ek, Lk, rk: Mk.T @ Xk
                 + Rk @ Uk
                 + Bk.T @ Yk1
                 + Ek.T @ Lk
                 + rk
-            )(M, X[:N], R, U, B, Y[1:], E, Lam, r).flatten(),
-            (Q[N] @ X[N] + q[N] - Y[N]),
+            )(M, X[:N], R, U, B, Y[1:], E, Lam[:N], r).flatten(),
+            (Q[N] @ X[N] + q[N] + D[N].T @ Lam[N] - Y[N]),
             (c[0] - X[0] - Delta[0] @ Y[0]),
             jax.vmap(
                 lambda Ak, Xk, Bk, Uk, ck1, Xk1, Deltak1, Yk1: Ak @ Xk
@@ -337,7 +347,8 @@ def compute_residual(
                 - Deltak1 @ Yk1
             )(A, X[:N], B, U, c[1:], X[1:], Delta[1:], Y[1:]).flatten(),
             jax.vmap(lambda Dk, Xk, Ek, Uk, dk, Sigmak, Lk: Dk @ Xk + Ek @ Uk - dk - Sigmak @ Lk)(
-                D, X[:N], E, U, d, Sigma, Lam
+                D[:N], X[:N], E, U, d[:N], Sigma[:N], Lam[:N]
             ).flatten(),
+            (D[N] @ X[N] - d[N] - Sigma[N] @ Lam[N]),
         ]
     )

@@ -7,11 +7,12 @@ This package solves the dynamic program
     subject to xₖ₊₁ = Aₖxₖ + Bₖuₖ + cₖ₊₁,        k = 0, ..., N-1
                x₀    = c₀
                Dₖxₖ + Eₖuₖ = dₖ,                  k = 0, ..., N-1
+               D_N x_N = d_N,
 
-i.e. an LQR problem with stagewise affine equality constraints. Dynamics and
-stagewise equality constraints may be dual-regularized with ``Delta`` and
-``Sigma`` blocks; setting those blocks to zero recovers exact dynamics and exact
-stagewise constraints.
+i.e. an LQR problem with stagewise affine equality constraints and terminal
+state constraints. Dynamics and equality constraints may be dual-regularized
+with ``Delta`` and ``Sigma`` blocks; setting those blocks to zero recovers exact
+hard equalities.
 
 Scope of the constraints — arbitrary ``Dx + Eu = d``
 ----------------------------------------------------
@@ -122,14 +123,23 @@ def _cost_to_go_sequential(inputs: FactorizationInputs, solve_inputs: SolveInput
     suffix = jax.tree.map(lambda x: x[::-1], suffix_rev)
 
     P, pv, F, Cll, g = jax.vmap(
-        lambda ivf: mixed_ivf_fold_terminal(ivf, inputs.Q[N], solve_inputs.q[N], n, p)
+        lambda ivf: mixed_ivf_fold_terminal(
+            ivf,
+            inputs.Q[N],
+            solve_inputs.q[N],
+            inputs.D[N],
+            inputs.Sigma[N],
+            solve_inputs.d[N],
+            n,
+            p,
+        )
     )(suffix)
 
     P = jnp.concatenate([P, inputs.Q[N][None]])
     pv = jnp.concatenate([pv, solve_inputs.q[N][None]])
-    F = jnp.concatenate([F, jnp.zeros((1, p, n), dtype=P.dtype)])
-    Cll = jnp.concatenate([Cll, jnp.zeros((1, p, p), dtype=P.dtype)])
-    g = jnp.concatenate([g, jnp.zeros((1, p), dtype=pv.dtype)])
+    F = jnp.concatenate([F, inputs.D[N][None]])
+    Cll = jnp.concatenate([Cll, inputs.Sigma[N][None]])
+    g = jnp.concatenate([g, solve_inputs.d[N][None]])
     return P, pv, F, Cll, g
 
 def _cost_to_go_parallel(inputs: FactorizationInputs, solve_inputs: SolveInputs):
@@ -159,15 +169,24 @@ def _cost_to_go_parallel(inputs: FactorizationInputs, solve_inputs: SolveInputs)
     scanned = jax.tree.map(lambda x: x[::-1], scanned_rev)  # IVF_{k->N}
 
     P, pv, F, Cll, g = jax.vmap(
-        lambda ivf: mixed_ivf_fold_terminal(ivf, inputs.Q[N], solve_inputs.q[N], n, p)
+        lambda ivf: mixed_ivf_fold_terminal(
+            ivf,
+            inputs.Q[N],
+            solve_inputs.q[N],
+            inputs.D[N],
+            inputs.Sigma[N],
+            solve_inputs.d[N],
+            n,
+            p,
+        )
     )(scanned)
 
     # append the terminal cost-to-go at k = N
     P = jnp.concatenate([P, inputs.Q[N][None]])
     pv = jnp.concatenate([pv, solve_inputs.q[N][None]])
-    F = jnp.concatenate([F, jnp.zeros((1, p, n))])
-    Cll = jnp.concatenate([Cll, jnp.zeros((1, p, p))])
-    g = jnp.concatenate([g, jnp.zeros((1, p))])
+    F = jnp.concatenate([F, inputs.D[N][None]])
+    Cll = jnp.concatenate([Cll, inputs.Sigma[N][None]])
+    g = jnp.concatenate([g, solve_inputs.d[N][None]])
     return P, pv, F, Cll, g
 
 
@@ -246,13 +265,13 @@ def _stage_feedback(inputs: FactorizationInputs, solve_inputs: SolveInputs, cog)
         B,
         M,
         R,
-        D,
+        D[:N],
         E,
         Delta[1:],
-        Sigma,
+        Sigma[:N],
         r,
         c[1:],
-        d,
+        d[:N],
         P[1:],
         pv[1:],
         F[1:],
@@ -340,12 +359,15 @@ def _recover_duals(inputs, solve_inputs, x, u):
     m, p = B.shape[2], D.shape[1]
 
     ny = (N + 1) * n
-    nvar = ny + N * p
+    nlam = N * p
+    terminal_lam0 = ny + nlam
+    nvar = terminal_lam0 + p
     nrow_x = (N + 1) * n
     nrow_u = N * m
     nrow_dyn = (N + 1) * n
     nrow_con = N * p
-    nrow = nrow_x + nrow_u + nrow_dyn + nrow_con
+    nrow_terminal_con = p
+    nrow = nrow_x + nrow_u + nrow_dyn + nrow_con + nrow_terminal_con
     dtype = jnp.result_type(A, B, Q, M, R, D, E, q, r, c, d)
     K = jnp.zeros((nrow, nvar), dtype=dtype)
     b = jnp.zeros((nrow,), dtype=dtype)
@@ -359,12 +381,13 @@ def _recover_duals(inputs, solve_inputs, x, u):
     I_n = jnp.eye(n, dtype=dtype)
     y_cols = jnp.arange(N + 1) * n
     lam_cols = ny + jnp.arange(N) * p
+    lam_terminal_col = terminal_lam0
 
     # x-stationarity, k = 0..N-1.
     x_rows = jnp.arange(N) * n
     K = scatter_blocks(K, x_rows, y_cols[:-1], jnp.broadcast_to(-I_n, (N, n, n)))
     K = scatter_blocks(K, x_rows, y_cols[1:], jnp.swapaxes(A, -1, -2))
-    K = scatter_blocks(K, x_rows, lam_cols, jnp.swapaxes(D, -1, -2))
+    K = scatter_blocks(K, x_rows, lam_cols, jnp.swapaxes(D[:N], -1, -2))
     bx = -jax.vmap(lambda Qk, xk, Mk, uk, qk: Qk @ xk + Mk @ uk + qk)(
         Q[:N], x[:N], M, u, q[:N]
     )
@@ -373,6 +396,9 @@ def _recover_duals(inputs, solve_inputs, x, u):
     # Terminal x-stationarity.
     terminal_row = N * n
     K = K.at[terminal_row : terminal_row + n, N * n : (N + 1) * n].set(-I_n)
+    K = K.at[terminal_row : terminal_row + n, lam_terminal_col : lam_terminal_col + p].set(
+        D[N].T
+    )
     b = b.at[terminal_row : terminal_row + n].set(-(Q[N] @ x[N] + q[N]))
 
     # u-stationarity.
@@ -400,16 +426,24 @@ def _recover_duals(inputs, solve_inputs, x, u):
     # Regularized stagewise equality equations.
     con_row0 = dyn_row0 + nrow_dyn
     con_rows = con_row0 + jnp.arange(N) * p
-    K = scatter_blocks(K, con_rows, lam_cols, -Sigma)
+    K = scatter_blocks(K, con_rows, lam_cols, -Sigma[:N])
     bcon = jax.vmap(lambda dk, Dk, xk, Ek, uk: dk - Dk @ xk - Ek @ uk)(
-        d, D, x[:N], E, u
+        d[:N], D[:N], x[:N], E, u
     )
     b = b.at[con_rows[:, None] + jnp.arange(p)[None, :]].set(bcon)
 
+    # Regularized terminal equality equation.
+    terminal_con_row = con_row0 + nrow_con
+    K = K.at[terminal_con_row : terminal_con_row + p, lam_terminal_col : lam_terminal_col + p].set(
+        -Sigma[N]
+    )
+    b = b.at[terminal_con_row : terminal_con_row + p].set(d[N] - D[N] @ x[N])
+
     sol = jnp.linalg.pinv(K) @ b
     y = sol[:ny].reshape(N + 1, n)
-    lam = sol[ny:].reshape(N, p)
-    return y, lam
+    lam = sol[ny:terminal_lam0].reshape(N, p)
+    lam_terminal = sol[terminal_lam0:]
+    return y, jnp.concatenate([lam, lam_terminal[None]])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -426,7 +460,7 @@ def _zero_solve_inputs(inputs: FactorizationInputs) -> SolveInputs:
         q=jnp.zeros((N + 1, n), dtype=dtype),
         r=jnp.zeros((N, m), dtype=dtype),
         c=jnp.zeros((N + 1, n), dtype=dtype),
-        d=jnp.zeros((N, p), dtype=dtype),
+        d=jnp.zeros((N + 1, p), dtype=dtype),
     )
 
 

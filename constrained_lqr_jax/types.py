@@ -3,6 +3,7 @@
 ``constrained_lqr_jax`` solves the *stagewise-constrained* LQR problem
 
     D_k x_k + E_k u_k = d_k,    k = 0, ..., N-1
+    D_N x_N         = d_N
 
 with optional dual regularization.  There is
 no rank requirement on ``D_k`` or ``E_k``: state-only constraints (``E_k = 0``),
@@ -21,11 +22,12 @@ from dataclasses import dataclass
 class FactorizationInputs:
     """LHS data for a stagewise-constrained LQR problem.
 
-    Stagewise affine equality constraints are supported for ``k = 0, ..., N-1``
-    with **arbitrary** ``D_k``, ``E_k`` (no rank requirement); ``p = 0`` gives
-    the unconstrained problem.  ``Delta`` regularizes dynamics multipliers and
-    ``Sigma`` regularizes stagewise equality multipliers.  Zero blocks recover
-    exact hard equalities.
+    Equality constraints are supported for ``k = 0, ..., N`` with **arbitrary**
+    ``D_k`` and stagewise ``E_k`` for ``k < N`` (no rank requirement);
+    terminal constraints use only ``D_N x_N = d_N``. ``p = 0`` gives the
+    unconstrained problem.  ``Delta`` regularizes dynamics multipliers and
+    ``Sigma`` regularizes equality multipliers. Zero blocks recover exact hard
+    equalities.
 
     Shapes (n, m state/control dims; p constraint dim):
         A: [N, n, n],
@@ -33,10 +35,10 @@ class FactorizationInputs:
         Q: [N+1, n, n],
         M: [N, n, m],
         R: [N, m, m],
-        D: [N, p, n],
+        D: [N+1, p, n],
         E: [N, p, m],
         Delta: [N+1, n, n] dynamics dual regularization,
-        Sigma: [N, p, p] constraint dual regularization.
+        Sigma: [N+1, p, p] constraint dual regularization.
     """
 
     A: jax.Array
@@ -96,7 +98,7 @@ class SolveInputs:
         q: [N+1, n],
         r: [N, m],
         c: [N+1, n],
-        d: [N, p].
+        d: [N+1, p].
     """
 
     q: jax.Array
@@ -114,7 +116,7 @@ class SolveOutputs:
         X:   [N+1, n]   states,
         U:   [N, m]     controls,
         Y:   [N+1, n]   dynamics multipliers,
-        Lam: [N, p]     constraint multipliers,
+        Lam: [N+1, p]   constraint multipliers,
         p:   [N+1, n]   affine cost-to-go vectors,
         k:   [N, m]     affine feedforward terms (unused; kept for layout).
     """
