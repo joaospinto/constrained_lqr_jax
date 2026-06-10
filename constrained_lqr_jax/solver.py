@@ -320,8 +320,8 @@ def _recover_duals(inputs, solve_inputs, x, u):
     """Recover a globally consistent multiplier representative.
 
     For rank-deficient hard constraints the multipliers are not unique.  This
-    solves the linear dual equations with a pseudoinverse and returns the
-    minimum-norm representative that is consistent with the already-computed
+    builds the global dual-only linear system with batched block scatters and
+    returns the minimum-norm representative consistent with the scan-computed
     primal trajectory.
     """
     A, B, Q, M, R, D, E, Delta, Sigma = (
@@ -341,48 +341,70 @@ def _recover_duals(inputs, solve_inputs, x, u):
 
     ny = (N + 1) * n
     nvar = ny + N * p
-    nrow = (N + 1) * n + N * m + (N + 1) * n + N * p
-    K = jnp.zeros((nrow, nvar), dtype=jnp.result_type(A, B, Q, M, R, D, E, q, r, c, d))
-    b = jnp.zeros((nrow,), dtype=K.dtype)
-    I = jnp.eye(n)
+    nrow_x = (N + 1) * n
+    nrow_u = N * m
+    nrow_dyn = (N + 1) * n
+    nrow_con = N * p
+    nrow = nrow_x + nrow_u + nrow_dyn + nrow_con
+    dtype = jnp.result_type(A, B, Q, M, R, D, E, q, r, c, d)
+    K = jnp.zeros((nrow, nvar), dtype=dtype)
+    b = jnp.zeros((nrow,), dtype=dtype)
 
-    def yi(k):
-        return k * n
+    def scatter_blocks(mat, row_starts, col_starts, blocks):
+        br, bc = blocks.shape[-2], blocks.shape[-1]
+        rows = row_starts[:, None, None] + jnp.arange(br)[None, :, None]
+        cols = col_starts[:, None, None] + jnp.arange(bc)[None, None, :]
+        return mat.at[rows, cols].set(blocks)
 
-    def li(k):
-        return ny + k * p
+    I_n = jnp.eye(n, dtype=dtype)
+    y_cols = jnp.arange(N + 1) * n
+    lam_cols = ny + jnp.arange(N) * p
 
-    row = 0
-    for k in range(N):
-        K = K.at[row : row + n, yi(k) : yi(k) + n].set(-I)
-        K = K.at[row : row + n, yi(k + 1) : yi(k + 1) + n].set(A[k].T)
-        K = K.at[row : row + n, li(k) : li(k) + p].set(D[k].T)
-        b = b.at[row : row + n].set(-(Q[k] @ x[k] + M[k] @ u[k] + q[k]))
-        row += n
+    # x-stationarity, k = 0..N-1.
+    x_rows = jnp.arange(N) * n
+    K = scatter_blocks(K, x_rows, y_cols[:-1], jnp.broadcast_to(-I_n, (N, n, n)))
+    K = scatter_blocks(K, x_rows, y_cols[1:], jnp.swapaxes(A, -1, -2))
+    K = scatter_blocks(K, x_rows, lam_cols, jnp.swapaxes(D, -1, -2))
+    bx = -jax.vmap(lambda Qk, xk, Mk, uk, qk: Qk @ xk + Mk @ uk + qk)(
+        Q[:N], x[:N], M, u, q[:N]
+    )
+    b = b.at[x_rows[:, None] + jnp.arange(n)[None, :]].set(bx)
 
-    K = K.at[row : row + n, yi(N) : yi(N) + n].set(-I)
-    b = b.at[row : row + n].set(-(Q[N] @ x[N] + q[N]))
-    row += n
+    # Terminal x-stationarity.
+    terminal_row = N * n
+    K = K.at[terminal_row : terminal_row + n, N * n : (N + 1) * n].set(-I_n)
+    b = b.at[terminal_row : terminal_row + n].set(-(Q[N] @ x[N] + q[N]))
 
-    for k in range(N):
-        K = K.at[row : row + m, yi(k + 1) : yi(k + 1) + n].set(B[k].T)
-        K = K.at[row : row + m, li(k) : li(k) + p].set(E[k].T)
-        b = b.at[row : row + m].set(-(M[k].T @ x[k] + R[k] @ u[k] + r[k]))
-        row += m
+    # u-stationarity.
+    u_row0 = nrow_x
+    u_rows = u_row0 + jnp.arange(N) * m
+    K = scatter_blocks(K, u_rows, y_cols[1:], jnp.swapaxes(B, -1, -2))
+    K = scatter_blocks(K, u_rows, lam_cols, jnp.swapaxes(E, -1, -2))
+    bu = -jax.vmap(lambda Mk, xk, Rk, uk, rk: Mk.T @ xk + Rk @ uk + rk)(
+        M, x[:N], R, u, r
+    )
+    b = b.at[u_rows[:, None] + jnp.arange(m)[None, :]].set(bu)
 
-    K = K.at[row : row + n, yi(0) : yi(0) + n].set(-Delta[0])
-    b = b.at[row : row + n].set(x[0] - c[0])
-    row += n
+    # Initial and transition dynamics regularization equations.
+    dyn_row0 = nrow_x + nrow_u
+    K = K.at[dyn_row0 : dyn_row0 + n, 0:n].set(-Delta[0])
+    b = b.at[dyn_row0 : dyn_row0 + n].set(x[0] - c[0])
 
-    for k in range(N):
-        K = K.at[row : row + n, yi(k + 1) : yi(k + 1) + n].set(-Delta[k + 1])
-        b = b.at[row : row + n].set(x[k + 1] - A[k] @ x[k] - B[k] @ u[k] - c[k + 1])
-        row += n
+    dyn_rows = dyn_row0 + n + jnp.arange(N) * n
+    K = scatter_blocks(K, dyn_rows, y_cols[1:], -Delta[1:])
+    bdyn = jax.vmap(lambda xk1, Ak, xk, Bk, uk, ck1: xk1 - Ak @ xk - Bk @ uk - ck1)(
+        x[1:], A, x[:N], B, u, c[1:]
+    )
+    b = b.at[dyn_rows[:, None] + jnp.arange(n)[None, :]].set(bdyn)
 
-    for k in range(N):
-        K = K.at[row : row + p, li(k) : li(k) + p].set(-Sigma[k])
-        b = b.at[row : row + p].set(d[k] - D[k] @ x[k] - E[k] @ u[k])
-        row += p
+    # Regularized stagewise equality equations.
+    con_row0 = dyn_row0 + nrow_dyn
+    con_rows = con_row0 + jnp.arange(N) * p
+    K = scatter_blocks(K, con_rows, lam_cols, -Sigma)
+    bcon = jax.vmap(lambda dk, Dk, xk, Ek, uk: dk - Dk @ xk - Ek @ uk)(
+        d, D, x[:N], E, u
+    )
+    b = b.at[con_rows[:, None] + jnp.arange(p)[None, :]].set(bcon)
 
     sol = jnp.linalg.pinv(K) @ b
     y = sol[:ny].reshape(N + 1, n)
