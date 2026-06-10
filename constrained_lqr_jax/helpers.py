@@ -3,9 +3,9 @@
 All functions here are pure and reusable by both the sequential and parallel
 algorithms in :mod:`constrained_lqr_jax.solver`.
 
-There is **no dual regularization** anywhere in this package: the dynamics
-equality ``A_k x_k + B_k u_k + c_{k+1} = x_{k+1}`` is enforced exactly, and the
-stagewise constraints ``D_k x_k + E_k u_k = d_k`` are enforced exactly as well.
+The package supports optional dual regularization: dynamics use blocks
+``Delta_k`` and stagewise equality constraints use blocks ``Sigma_k``. Setting
+these blocks to zero recovers exact dynamics and exact stagewise constraints.
 
 The parallel backward pass is built on the *mixed-constraint interval value
 function* (IVF) — a uniform, fixed-dimension representation of the cost-to-go of
@@ -60,7 +60,7 @@ def mixed_ivf_base(inputs: FactorizationInputs, solve_inputs: SolveInputs):
     constraint multiplier ``λ_k`` is *not* eliminated — it is carried.  Returns
     a 9-tuple of arrays each stacked over ``k = 0, ..., N-1``.
     """
-    A, B, Q, M, R, D, E = (
+    A, B, Q, M, R, D, E, Delta, Sigma = (
         inputs.A,
         inputs.B,
         inputs.Q,
@@ -68,11 +68,13 @@ def mixed_ivf_base(inputs: FactorizationInputs, solve_inputs: SolveInputs):
         inputs.R,
         inputs.D,
         inputs.E,
+        inputs.Delta,
+        inputs.Sigma,
     )
     q, r, c, d = (solve_inputs.q, solve_inputs.r, solve_inputs.c, solve_inputs.d)
     N = A.shape[0]
 
-    def one(Ak, Bk, Qk, Mk, Rk, Dk, Ek, qk, rk, ck1, dk):
+    def one(Ak, Bk, Qk, Mk, Rk, Dk, Ek, Deltak1, Sigmak, qk, rk, ck1, dk):
         Rinv = jnp.linalg.inv(Rk)
         RiMt = Rinv @ Mk.T
         RiBt = Rinv @ Bk.T
@@ -81,15 +83,15 @@ def mixed_ivf_base(inputs: FactorizationInputs, solve_inputs: SolveInputs):
         P = symmetrize(Qk - Mk @ RiMt)
         pv = qk - Mk @ Rir
         Ao = Ak - Bk @ RiMt
-        Cc = symmetrize(Bk @ RiBt)
+        Cc = symmetrize(Bk @ RiBt + Deltak1)
         co = ck1 - Bk @ Rir
         Cyl = Bk @ RiEt
-        Cll = symmetrize(Ek @ RiEt)
+        Cll = symmetrize(Ek @ RiEt + Sigmak)
         F = Dk - Ek @ RiMt
         g = dk + Ek @ Rir
         return P, pv, Ao, Cc, co, Cyl, Cll, F, g
 
-    return jax.vmap(one)(A, B, Q[:N], M, R, D, E, q[:N], r, c[1:], d)
+    return jax.vmap(one)(A, B, Q[:N], M, R, D, E, Delta[1:], Sigma, q[:N], r, c[1:], d)
 
 
 def _schur_eliminate(H, h, n_outer):
@@ -282,9 +284,9 @@ def compute_residual(
         stationarity in x:  Q x + M u + Aᵀ y₊ + Dᵀ λ + q - y,
         stationarity in u:  Mᵀ x + R u + Bᵀ y₊ + Eᵀ λ + r,
         terminal x:         Q_N x_N + q_N - y_N,
-        initial dynamics:   c₀ - x₀,
-        dynamics:           A x + B u + c₊ - x₊,
-        constraints:        D x + E u - d.
+        initial dynamics:   c₀ - x₀ - Delta₀ y₀,
+        dynamics:           A x + B u + c₊ - x₊ - Delta₊ y₊,
+        constraints:        D x + E u - d - Sigma λ.
     """
     A = factorization_inputs.A
     B = factorization_inputs.B
@@ -293,6 +295,8 @@ def compute_residual(
     R = factorization_inputs.R
     D = factorization_inputs.D
     E = factorization_inputs.E
+    Delta = factorization_inputs.Delta
+    Sigma = factorization_inputs.Sigma
 
     q = solve_inputs.q
     r = solve_inputs.r
@@ -324,12 +328,16 @@ def compute_residual(
                 + rk
             )(M, X[:N], R, U, B, Y[1:], E, Lam, r).flatten(),
             (Q[N] @ X[N] + q[N] - Y[N]),
-            (c[0] - X[0]),
-            jax.vmap(lambda Ak, Xk, Bk, Uk, ck1, Xk1: Ak @ Xk + Bk @ Uk + ck1 - Xk1)(
-                A, X[:N], B, U, c[1:], X[1:]
-            ).flatten(),
-            jax.vmap(lambda Dk, Xk, Ek, Uk, dk: Dk @ Xk + Ek @ Uk - dk)(
-                D, X[:N], E, U, d
+            (c[0] - X[0] - Delta[0] @ Y[0]),
+            jax.vmap(
+                lambda Ak, Xk, Bk, Uk, ck1, Xk1, Deltak1, Yk1: Ak @ Xk
+                + Bk @ Uk
+                + ck1
+                - Xk1
+                - Deltak1 @ Yk1
+            )(A, X[:N], B, U, c[1:], X[1:], Delta[1:], Y[1:]).flatten(),
+            jax.vmap(lambda Dk, Xk, Ek, Uk, dk, Sigmak, Lk: Dk @ Xk + Ek @ Uk - dk - Sigmak @ Lk)(
+                D, X[:N], E, U, d, Sigma, Lam
             ).flatten(),
         ]
     )

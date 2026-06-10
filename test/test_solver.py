@@ -38,7 +38,7 @@ def _spd(rng, s):
     return L @ L.T + s * np.eye(s)
 
 
-def make_problem(seed, N, n, m, p, emode):
+def make_problem(seed, N, n, m, p, emode, regularized=False):
     """Random *feasible* problem.  ``emode`` in {'zero','full','mixed'}."""
     rng = np.random.default_rng(seed)
     Q = np.stack([_spd(rng, n) for _ in range(N + 1)])
@@ -70,6 +70,16 @@ def make_problem(seed, N, n, m, p, emode):
         if p > 0
         else np.zeros((N, 0))
     )
+    if regularized:
+        Delta = np.stack([np.diag(0.02 + 0.01 * rng.random(n)) for _ in range(N + 1)])
+        Sigma = (
+            np.stack([np.diag(0.03 + 0.02 * rng.random(p)) for _ in range(N)])
+            if p > 0
+            else np.zeros((N, 0, 0))
+        )
+    else:
+        Delta = np.zeros((N + 1, n, n))
+        Sigma = np.zeros((N, p, p))
     fac = FactorizationInputs(
         A=jnp.array(A),
         B=jnp.array(B),
@@ -78,6 +88,8 @@ def make_problem(seed, N, n, m, p, emode):
         R=jnp.array(R),
         D=jnp.array(D),
         E=jnp.array(E),
+        Delta=jnp.array(Delta),
+        Sigma=jnp.array(Sigma),
     )
     si = SolveInputs(q=jnp.array(q), r=jnp.array(r), c=jnp.array(c), d=jnp.array(d))
     return fac, si
@@ -86,7 +98,7 @@ def make_problem(seed, N, n, m, p, emode):
 def dense_primal(fac, si):
     """Ground-truth primal via a dense least-squares KKT solve (handles the
     degenerate state-only case where the KKT is singular)."""
-    A, B, Q, M, R, D, E = (
+    A, B, Q, M, R, D, E, Delta, Sigma = (
         np.array(fac.A),
         np.array(fac.B),
         np.array(fac.Q),
@@ -94,6 +106,8 @@ def dense_primal(fac, si):
         np.array(fac.R),
         np.array(fac.D),
         np.array(fac.E),
+        np.array(fac.Delta),
+        np.array(fac.Sigma),
     )
     q, r, c, d = (np.array(si.q), np.array(si.r), np.array(si.c), np.array(si.d))
     N, n, m, p = A.shape[0], A.shape[1], B.shape[2], D.shape[1]
@@ -111,6 +125,7 @@ def dense_primal(fac, si):
     xsN = N * (n + m)
     K[xsN : xsN + n, xsN : xsN + n] = Q[N]
     K[nxu : nxu + n, 0:n] = -np.eye(n)
+    K[nxu : nxu + n, nxu : nxu + n] = -Delta[0]
     K[0:n, nxu : nxu + n] = -np.eye(n)
     for k in range(N):
         ys = nxu + (k + 1) * n
@@ -119,6 +134,7 @@ def dense_primal(fac, si):
         K[ys : ys + n, xk : xk + n] = A[k]
         K[ys : ys + n, uk : uk + m] = B[k]
         K[ys : ys + n, xk1 : xk1 + n] = -np.eye(n)
+        K[ys : ys + n, ys : ys + n] = -Delta[k + 1]
         K[xk : xk + n, ys : ys + n] = A[k].T
         K[uk : uk + m, ys : ys + n] = B[k].T
         K[xk1 : xk1 + n, ys : ys + n] = -np.eye(n)
@@ -127,6 +143,7 @@ def dense_primal(fac, si):
         xk, uk = k * (n + m), k * (n + m) + n
         K[ls : ls + p, xk : xk + n] = D[k]
         K[ls : ls + p, uk : uk + m] = E[k]
+        K[ls : ls + p, ls : ls + p] = -Sigma[k]
         K[xk : xk + n, ls : ls + p] = D[k].T
         K[uk : uk + m, ls : ls + p] = E[k].T
     for k in range(N):
@@ -276,7 +293,7 @@ def test_infeasible_is_reported(parallel):
     D = np.array(fac.D)
     D[0] = rng.standard_normal((1, 3))  # stage-0 state constraint vs forced x0=c0
     fac2 = FactorizationInputs(
-        A=fac.A, B=fac.B, Q=fac.Q, M=fac.M, R=fac.R, D=jnp.array(D), E=fac.E
+        A=fac.A, B=fac.B, Q=fac.Q, M=fac.M, R=fac.R, D=jnp.array(D), E=fac.E, Delta=fac.Delta, Sigma=fac.Sigma
     )
     sol, st = solve_general(fac2, si, parallel=parallel)
     assert not bool(st.feasible)
@@ -290,6 +307,30 @@ def test_solve_general_feasible(parallel):
     sol, st = solve_general(fac, si, parallel=parallel)
     assert bool(st.feasible)
     assert float(st.residual) < 1e-6
+
+
+@pytest.mark.parametrize("solver_name,solver", SOLVERS)
+def test_regularized_dynamics_and_constraints_match_dense(solver_name, solver):
+    fac, si = make_problem(101, 5, 3, 2, 2, "mixed", regularized=True)
+    sol = solver(fac, si)
+    xd, ud = dense_primal(fac, si)
+    np.testing.assert_allclose(sol.X, xd, atol=1e-6, rtol=1e-5)
+    np.testing.assert_allclose(sol.U, ud, atol=1e-6, rtol=1e-5)
+    np.testing.assert_allclose(compute_residual(fac, si, sol), 0, atol=1e-8)
+
+
+def test_regularized_constraints_are_not_forced_exactly():
+    fac, si = make_problem(102, 5, 3, 2, 2, "full", regularized=True)
+    sol = factor_and_solve(fac, si)
+    raw = jax.vmap(lambda Dk, xk, Ek, uk, dk: Dk @ xk + Ek @ uk - dk)(
+        fac.D, sol.X[:5], fac.E, sol.U, si.d
+    )
+    np.testing.assert_allclose(
+        raw,
+        jax.vmap(lambda Sigmak, Lk: Sigmak @ Lk)(fac.Sigma, sol.Lam),
+        atol=1e-8,
+    )
+    assert float(jnp.max(jnp.abs(raw))) > 1e-8
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -309,6 +350,8 @@ def test_nontrivial_constraints_change_solution(solver_name, solver):
         R=fac.R,
         D=jnp.zeros((5, 0, 3)),
         E=jnp.zeros((5, 0, 2)),
+        Delta=fac.Delta,
+        Sigma=jnp.zeros((5, 0, 0)),
     )
     si0 = SolveInputs(q=si.q, r=si.r, c=si.c, d=jnp.zeros((5, 0)))
     sol_u = solver(fac0, si0)
@@ -326,6 +369,8 @@ def test_identity_dynamics(solver_name, solver):
         R=fac.R,
         D=fac.D,
         E=fac.E,
+        Delta=fac.Delta,
+        Sigma=fac.Sigma,
     )
     sol = solver(fac, si)
     xd, ud = dense_primal(fac, si)

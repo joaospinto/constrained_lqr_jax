@@ -1,4 +1,4 @@
-"""Sequential and parallel solver for stagewise-constrained LQR (no dual reg).
+"""Solver for stagewise-constrained LQR with optional dual regularization.
 
 This package solves the dynamic program
 
@@ -8,8 +8,10 @@ This package solves the dynamic program
                x₀    = c₀
                Dₖxₖ + Eₖuₖ = dₖ,                  k = 0, ..., N-1
 
-i.e. an LQR problem with stagewise affine equality constraints and **no dual
-regularization** (the dynamics are enforced exactly).
+i.e. an LQR problem with stagewise affine equality constraints. Dynamics and
+stagewise equality constraints may be dual-regularized with ``Delta`` and
+``Sigma`` blocks; setting those blocks to zero recovers exact dynamics and exact
+stagewise constraints.
 
 Scope of the constraints — arbitrary ``Dx + Eu = d``
 ----------------------------------------------------
@@ -21,8 +23,8 @@ There is **no rank requirement** on ``D_k`` or ``E_k``.  The solver handles
   * the full-row-rank case, and
   * the unconstrained problem (``p = 0``, empty ``D`` / ``E`` / ``d``),
 
-all with a single, branch-free code path.  Constraints are enforced exactly
-(no ``ε·I`` regularization).  This is achieved by *carrying* the constraint
+all with a single, branch-free representation.  With zero regularization,
+constraints are enforced exactly.  This is achieved by *carrying* the constraint
 through the cost-to-go (the constraint-carrying / "mixed" interval value
 function, formalized in ``MixedConstraintIVF.lean``) rather than eliminating the
 constraint multiplier at the base case.
@@ -32,29 +34,24 @@ Algorithms
 Both a **sequential** and a **parallel** algorithm are provided and produce
 identical solutions:
 
-  - Sequential (``factor_and_solve`` / ``solve_general``):
-      backward cost-to-go via ``jax.lax.scan`` and a forward primal sweep via
-      ``jax.lax.scan``.  O(N · (n + m + p)³) work, O(N) depth.
-  - Parallel   (``factor_and_solve_parallel`` / ``solve_general(..., parallel=True)``):
-      backward cost-to-go via an ``associative_scan`` over the mixed IVF, and a
-      forward primal sweep via an affine ``associative_scan``.  Same work,
-      O(log N) depth.
+  - Sequential/parallel factorization helpers expose the same API shape as
+    ``regularized_lqr_jax``.
+  - The public solve paths use scan-native backward and forward passes.  For
+    zero ``Delta`` and ``Sigma`` this is the original exact constrained LQR
+    system.
 
-In both cases the dual variables ``(y, λ)`` of the *returned* primal point are
-recovered with a single global least-squares solve on the KKT stationarity
-equations (:func:`_recover_duals`); this gives the (min-norm) multipliers and is
-uniform across all constraint ranks, including the degenerate ones where the
-multipliers are non-unique.
+In degenerate zero-regularization cases the dual variables ``(y, λ)`` may be
+non-unique.  The solver recovers a minimum-norm globally consistent multiplier
+representative after the scan-native primal pass (:func:`_recover_duals`).
 
 Infeasibility / degeneracy
 --------------------------
 The solver always returns finite numbers (never NaN).  Whether the returned
-point is an actual solution is reported explicitly by :func:`solve_general`,
-whose :class:`GeneralStatus` ``feasible`` flag and ``residual`` are computed from
-the full KKT residual of the returned point.  An infeasible problem (e.g.
-``D_0 c_0 ≠ d_0`` for a hard stage-0 state constraint, or a constraint no
-control can satisfy) yields ``feasible = False`` and a large ``residual`` rather
-than silent NaNs.
+point satisfies the requested regularized KKT system is reported explicitly by
+:func:`solve_general`, whose :class:`GeneralStatus` ``feasible`` flag and
+``residual`` are computed from the full KKT residual of the returned point.  With
+zero regularization, an infeasible hard-constrained problem yields
+``feasible = False`` and a large ``residual`` rather than silent NaNs.
 
 References:
   - Sousa-Pinto & Orban, "Dual-Regularized Riccati Recursions"
@@ -101,55 +98,39 @@ class GeneralStatus(NamedTuple):
 
 
 def _cost_to_go_sequential(inputs: FactorizationInputs, solve_inputs: SolveInputs):
-    """Sequential backward pass via ``jax.lax.scan``.
+    """Sequential suffix scan over mixed IVFs.
 
-    Returns the carried cost-to-go ``(P, p, F, Cll, g)`` with arrays of shape
-    ``(N+1, ...)`` indexed by stage ``k = 0..N``.
+    This supports the same regularized interval representation as the parallel
+    associative scan, but composes intervals right-to-left with ``lax.scan``.
     """
-    A, B, Q, M, R, D, E = (
-        inputs.A,
-        inputs.B,
-        inputs.Q,
-        inputs.M,
-        inputs.R,
-        inputs.D,
-        inputs.E,
+    N, n = inputs.A.shape[0], inputs.A.shape[1]
+    p = inputs.D.shape[1]
+    base = mixed_ivf_base(inputs, solve_inputs)
+
+    rev = jax.tree.map(lambda x: x[::-1], base)
+
+    def step(acc, new_left):
+        combined = mixed_ivf_combine(new_left, acc, n, p)
+        return combined, combined
+
+    first = jax.tree.map(lambda x: x[0], rev)
+    rest = jax.tree.map(lambda x: x[1:], rev)
+    _, suffix_rest = jax.lax.scan(step, first, rest)
+    suffix_rev = jax.tree.map(
+        lambda f, r: jnp.concatenate([f[None], r]), first, suffix_rest
     )
-    q, r, c, d = (solve_inputs.q, solve_inputs.r, solve_inputs.c, solve_inputs.d)
-    N, n = A.shape[0], A.shape[1]
-    p = D.shape[1]
+    suffix = jax.tree.map(lambda x: x[::-1], suffix_rev)
 
-    def step(carry, stage):
-        Pp, ppv, Fp, Cllp, gp = carry
-        Qk, Rk, Mk, Ak, Bk, Dk, Ek, qk, rk, ck1, dk = stage
+    P, pv, F, Cll, g = jax.vmap(
+        lambda ivf: mixed_ivf_fold_terminal(ivf, inputs.Q[N], solve_inputs.q[N], n, p)
+    )(suffix)
 
-        Hww = jnp.block([[Qk + Ak.T @ Pp @ Ak, Dk.T], [Dk, jnp.zeros((p, p))]])
-        Hws = jnp.block(
-            [[Mk + Ak.T @ Pp @ Bk, Ak.T @ Fp.T], [Ek, jnp.zeros((p, p))]]
-        )
-        Hss = jnp.block([[Rk + Bk.T @ Pp @ Bk, Bk.T @ Fp.T], [Fp @ Bk, -Cllp]])
-        bw = jnp.concatenate([qk + Ak.T @ Pp @ ck1 + Ak.T @ ppv, -dk])
-        bs = jnp.concatenate([rk + Bk.T @ Pp @ ck1 + Bk.T @ ppv, Fp @ ck1 - gp])
-
-        Hss_pinv = jnp.linalg.pinv(Hss)
-        Hhat = Hww - Hws @ Hss_pinv @ Hws.T
-        bhat = bw - Hws @ Hss_pinv @ bs
-
-        P_new = 0.5 * (Hhat[:n, :n] + Hhat[:n, :n].T)
-        F_new = Hhat[n:, :n]
-        Cll_new = -0.5 * (Hhat[n:, n:] + Hhat[n:, n:].T)
-        p_new = bhat[:n]
-        g_new = -bhat[n:]
-        new = (P_new, p_new, F_new, Cll_new, g_new)
-        return new, new
-
-    terminal = (Q[N], q[N], jnp.zeros((p, n)), jnp.zeros((p, p)), jnp.zeros(p))
-    rev = jax.tree.map(lambda x: x[::-1], (Q[:N], R, M, A, B, D, E, q[:N], r, c[1:], d))
-    _, outs = jax.lax.scan(step, terminal, rev)
-    outs = jax.tree.map(lambda x: x[::-1], outs)  # k = 0..N-1
-    cog = jax.tree.map(lambda o, t: jnp.concatenate([o, t[None]]), outs, terminal)
-    return cog  # (P, p, F, Cll, g), each (N+1, ...)
-
+    P = jnp.concatenate([P, inputs.Q[N][None]])
+    pv = jnp.concatenate([pv, solve_inputs.q[N][None]])
+    F = jnp.concatenate([F, jnp.zeros((1, p, n), dtype=P.dtype)])
+    Cll = jnp.concatenate([Cll, jnp.zeros((1, p, p), dtype=P.dtype)])
+    g = jnp.concatenate([g, jnp.zeros((1, p), dtype=pv.dtype)])
+    return P, pv, F, Cll, g
 
 def _cost_to_go_parallel(inputs: FactorizationInputs, solve_inputs: SolveInputs):
     """Parallel backward pass via an associative scan over the mixed IVF.
@@ -196,67 +177,124 @@ def _cost_to_go_parallel(inputs: FactorizationInputs, solve_inputs: SolveInputs)
 
 
 def _stage_feedback(inputs: FactorizationInputs, solve_inputs: SolveInputs, cog):
-    """Per-stage affine feedback ``u_k = K_k x_k + k_k`` and the closed-loop
-    transition ``x_{k+1} = Φ_k x_k + ψ_k``.
+    """Per-stage affine maps from ``x_k`` to local primal/dual variables.
 
-    Solved from the stage KKT (control + carried right constraint + stage
-    constraint) with the next-stage cost-to-go on the RHS; a pseudo-inverse
-    keeps it well-defined for any constraint rank.  Returns ``(K, k, Φ, ψ)``.
+    The local unknowns are ``(u_k, y_{k+1}, lambda_k, mu_{k+1}, x_{k+1})``.
+    ``mu`` is the carried multiplier for the next cost-to-go constraint.  A
+    pseudoinverse is used because arbitrary-rank equality constraints can make
+    this local saddle system singular while still admitting a valid minimum-norm
+    KKT representative.
     """
-    A, B, M, R, D, E = (inputs.A, inputs.B, inputs.M, inputs.R, inputs.D, inputs.E)
+    A, B, M, R, D, E, Delta, Sigma = (
+        inputs.A,
+        inputs.B,
+        inputs.M,
+        inputs.R,
+        inputs.D,
+        inputs.E,
+        inputs.Delta,
+        inputs.Sigma,
+    )
     r, c, d = solve_inputs.r, solve_inputs.c, solve_inputs.d
     P, pv, F, Cll, g = cog
     N, n = A.shape[0], A.shape[1]
     m, p = B.shape[2], D.shape[1]
 
-    def stage(Ak, Bk, Mk, Rk, Dk, Ek, rk, ck1, dk, Pp, ppv, Fp, Cllp, gp):
-        G = Rk + Bk.T @ Pp @ Bk
-        KKT = jnp.block(
+    def stage(Ak, Bk, Mk, Rk, Dk, Ek, Deltap, Sigmak, rk, ck1, dk, Pp, ppv, Fp, Cllp, gp):
+        eye_n = jnp.eye(n)
+        eye_p = jnp.eye(p)
+        Z = jnp.block(
             [
-                [G, Bk.T @ Fp.T, Ek.T],
-                [Fp @ Bk, -Cllp, jnp.zeros((p, p))],
-                [Ek, jnp.zeros((p, p)), jnp.zeros((p, p))],
+                [Rk, Bk.T, Ek.T, jnp.zeros((m, p)), jnp.zeros((m, n))],
+                [Bk, -Deltap, jnp.zeros((n, p)), jnp.zeros((n, p)), -eye_n],
+                [Ek, jnp.zeros((p, n)), -Sigmak, jnp.zeros((p, p)), jnp.zeros((p, n))],
+                [jnp.zeros((n, m)), -eye_n, jnp.zeros((n, p)), Fp.T, Pp],
+                [jnp.zeros((p, m)), jnp.zeros((p, n)), jnp.zeros((p, p)), -Cllp, Fp],
             ]
         )
-        # RHS as an affine function of x_k:  rhs = coeff_x @ x_k + const
-        coeff_x = jnp.concatenate([-(Mk.T + Bk.T @ Pp @ Ak), -(Fp @ Ak), -Dk], axis=0)
-        const = jnp.concatenate(
-            [-(Bk.T @ Pp @ ck1 + Bk.T @ ppv + rk), gp - Fp @ ck1, dk]
+        coeff_x = jnp.concatenate(
+            [
+                -Mk.T,
+                -Ak,
+                -Dk,
+                jnp.zeros((n, n)),
+                jnp.zeros((p, n)),
+            ],
+            axis=0,
         )
+        const = jnp.concatenate([-rk, -ck1, dk, -ppv, gp])
         rhs = jnp.concatenate([coeff_x, const[:, None]], axis=1)
-        sol = jnp.linalg.lstsq(KKT, rhs, rcond=None)[0]
-        K = sol[:m, :n]
-        k = sol[:m, n]
-        Phi = Ak + Bk @ K
-        psi = Bk @ k + ck1
-        return K, k, Phi, psi
+        sol = jnp.linalg.pinv(Z) @ rhs
+
+        u = sol[:m]
+        y = sol[m : m + n]
+        lam = sol[m + n : m + n + p]
+        xnext = sol[m + n + p + p :]
+        return (
+            u[:, :n],
+            u[:, n],
+            xnext[:, :n],
+            xnext[:, n],
+            y[:, :n],
+            y[:, n],
+            lam[:, :n],
+            lam[:, n],
+        )
 
     return jax.vmap(stage)(
-        A, B, M, R, D, E, r, c[1:], d, P[1:], pv[1:], F[1:], Cll[1:], g[1:]
+        A,
+        B,
+        M,
+        R,
+        D,
+        E,
+        Delta[1:],
+        Sigma,
+        r,
+        c[1:],
+        d,
+        P[1:],
+        pv[1:],
+        F[1:],
+        Cll[1:],
+        g[1:],
     )
+
+def _initial_state_and_dual(inputs, solve_inputs, K0, k0, YK0, yk0, LK0, lk0):
+    G = inputs.Q[0] + inputs.M[0] @ K0 + inputs.A[0].T @ YK0 + inputs.D[0].T @ LK0
+    h = inputs.M[0] @ k0 + inputs.A[0].T @ yk0 + inputs.D[0].T @ lk0 + solve_inputs.q[0]
+    x0 = jnp.linalg.pinv(jnp.eye(inputs.A.shape[1]) + inputs.Delta[0] @ G) @ (
+        solve_inputs.c[0] - inputs.Delta[0] @ h
+    )
+    y0 = G @ x0 + h
+    return x0, y0
 
 
 def _forward_primal_sequential(inputs, solve_inputs, cog):
-    """Sequential forward primal sweep via ``jax.lax.scan``."""
-    K, k, Phi, psi = _stage_feedback(inputs, solve_inputs, cog)
-    x0 = solve_inputs.c[0]
+    """Sequential forward sweep for primal and dual variables."""
+    K, k, Phi, psi, YK, yk, LK, lk = _stage_feedback(inputs, solve_inputs, cog)
+    x0, y0 = _initial_state_and_dual(inputs, solve_inputs, K[0], k[0], YK[0], yk[0], LK[0], lk[0])
 
     def step(x_k, stage):
-        K_k, k_k, Phi_k, psi_k = stage
+        K_k, k_k, Phi_k, psi_k, YK_k, yk_k, LK_k, lk_k = stage
         u_k = K_k @ x_k + k_k
         x_k1 = Phi_k @ x_k + psi_k
-        return x_k1, (x_k, u_k)
+        y_k1 = YK_k @ x_k + yk_k
+        lam_k = LK_k @ x_k + lk_k
+        return x_k1, (x_k, u_k, y_k1, lam_k)
 
-    x_N, (x_rest, u) = jax.lax.scan(step, x0, (K, k, Phi, psi))
+    x_N, (x_rest, u, y_next, lam) = jax.lax.scan(
+        step, x0, (K, k, Phi, psi, YK, yk, LK, lk)
+    )
     x = jnp.concatenate([x_rest, x_N[None]])
-    return x, u
+    y = jnp.concatenate([y0[None], y_next])
+    return x, u, y, lam, k
 
 
 def _forward_primal_parallel(inputs, solve_inputs, cog):
-    """Parallel forward primal sweep via an affine associative scan."""
-    K, k, Phi, psi = _stage_feedback(inputs, solve_inputs, cog)
-    x0 = solve_inputs.c[0]
-    N = inputs.A.shape[0]
+    """Parallel forward sweep for primal and dual variables."""
+    K, k, Phi, psi, YK, yk, LK, lk = _stage_feedback(inputs, solve_inputs, cog)
+    x0, y0 = _initial_state_and_dual(inputs, solve_inputs, K[0], k[0], YK[0], yk[0], LK[0], lk[0])
 
     def compose(earlier, later):
         f1, M1 = earlier
@@ -266,8 +304,11 @@ def _forward_primal_parallel(inputs, solve_inputs, cog):
     composed_psi, composed_Phi = jax.lax.associative_scan(compose, (psi, Phi))
     x_rest = jax.vmap(lambda Mk, fk: Mk @ x0 + fk)(composed_Phi, composed_psi)
     x = jnp.concatenate([x0[None], x_rest])
-    u = jax.vmap(lambda K_k, x_k, k_k: K_k @ x_k + k_k)(K, x[:N], k)
-    return x, u
+    u = jax.vmap(lambda K_k, x_k, k_k: K_k @ x_k + k_k)(K, x[:-1], k)
+    y_next = jax.vmap(lambda YK_k, x_k, yk_k: YK_k @ x_k + yk_k)(YK, x[:-1], yk)
+    lam = jax.vmap(lambda LK_k, x_k, lk_k: LK_k @ x_k + lk_k)(LK, x[:-1], lk)
+    y = jnp.concatenate([y0[None], y_next])
+    return x, u, y, lam, k
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -276,14 +317,14 @@ def _forward_primal_parallel(inputs, solve_inputs, cog):
 
 
 def _recover_duals(inputs, solve_inputs, x, u):
-    """Recover ``(y, λ)`` by least-squares on the KKT stationarity equations.
+    """Recover a globally consistent multiplier representative.
 
-    Returns the (min-norm) multipliers consistent with the primal ``(x, u)``;
-    these are the unique multipliers whenever the KKT system is nonsingular, and
-    a valid KKT point's multipliers otherwise.  Shared by both the sequential
-    and parallel solvers.
+    For rank-deficient hard constraints the multipliers are not unique.  This
+    solves the linear dual equations with a pseudoinverse and returns the
+    minimum-norm representative that is consistent with the already-computed
+    primal trajectory.
     """
-    A, B, Q, M, R, D, E = (
+    A, B, Q, M, R, D, E, Delta, Sigma = (
         inputs.A,
         inputs.B,
         inputs.Q,
@@ -291,44 +332,59 @@ def _recover_duals(inputs, solve_inputs, x, u):
         inputs.R,
         inputs.D,
         inputs.E,
+        inputs.Delta,
+        inputs.Sigma,
     )
-    q, r = solve_inputs.q, solve_inputs.r
+    q, r, c, d = solve_inputs.q, solve_inputs.r, solve_inputs.c, solve_inputs.d
     N, n = A.shape[0], A.shape[1]
     m, p = B.shape[2], D.shape[1]
 
     ny = (N + 1) * n
     nvar = ny + N * p
-    nrow = ny + N * m
-    K = jnp.zeros((nrow, nvar))
-    b = jnp.zeros(nrow)
+    nrow = (N + 1) * n + N * m + (N + 1) * n + N * p
+    K = jnp.zeros((nrow, nvar), dtype=jnp.result_type(A, B, Q, M, R, D, E, q, r, c, d))
+    b = jnp.zeros((nrow,), dtype=K.dtype)
     I = jnp.eye(n)
 
-    def yi(kk):
-        return kk * n
+    def yi(k):
+        return k * n
 
-    def li(kk):
-        return ny + kk * p
+    def li(k):
+        return ny + k * p
 
     row = 0
-    # x-stationarity k = 0..N-1
-    for kk in range(N):
-        K = K.at[row : row + n, yi(kk) : yi(kk) + n].set(-I)
-        K = K.at[row : row + n, yi(kk + 1) : yi(kk + 1) + n].set(A[kk].T)
-        K = K.at[row : row + n, li(kk) : li(kk) + p].set(D[kk].T)
-        b = b.at[row : row + n].set(-(Q[kk] @ x[kk] + M[kk] @ u[kk] + q[kk]))
+    for k in range(N):
+        K = K.at[row : row + n, yi(k) : yi(k) + n].set(-I)
+        K = K.at[row : row + n, yi(k + 1) : yi(k + 1) + n].set(A[k].T)
+        K = K.at[row : row + n, li(k) : li(k) + p].set(D[k].T)
+        b = b.at[row : row + n].set(-(Q[k] @ x[k] + M[k] @ u[k] + q[k]))
         row += n
-    # terminal
+
     K = K.at[row : row + n, yi(N) : yi(N) + n].set(-I)
     b = b.at[row : row + n].set(-(Q[N] @ x[N] + q[N]))
     row += n
-    # u-stationarity k = 0..N-1
-    for kk in range(N):
-        K = K.at[row : row + m, yi(kk + 1) : yi(kk + 1) + n].set(B[kk].T)
-        K = K.at[row : row + m, li(kk) : li(kk) + p].set(E[kk].T)
-        b = b.at[row : row + m].set(-(M[kk].T @ x[kk] + R[kk] @ u[kk] + r[kk]))
+
+    for k in range(N):
+        K = K.at[row : row + m, yi(k + 1) : yi(k + 1) + n].set(B[k].T)
+        K = K.at[row : row + m, li(k) : li(k) + p].set(E[k].T)
+        b = b.at[row : row + m].set(-(M[k].T @ x[k] + R[k] @ u[k] + r[k]))
         row += m
 
-    sol = jnp.linalg.lstsq(K, b, rcond=None)[0]
+    K = K.at[row : row + n, yi(0) : yi(0) + n].set(-Delta[0])
+    b = b.at[row : row + n].set(x[0] - c[0])
+    row += n
+
+    for k in range(N):
+        K = K.at[row : row + n, yi(k + 1) : yi(k + 1) + n].set(-Delta[k + 1])
+        b = b.at[row : row + n].set(x[k + 1] - A[k] @ x[k] - B[k] @ u[k] - c[k + 1])
+        row += n
+
+    for k in range(N):
+        K = K.at[row : row + p, li(k) : li(k) + p].set(-Sigma[k])
+        b = b.at[row : row + p].set(d[k] - D[k] @ x[k] - E[k] @ u[k])
+        row += p
+
+    sol = jnp.linalg.pinv(K) @ b
     y = sol[:ny].reshape(N + 1, n)
     lam = sol[ny:].reshape(N, p)
     return y, lam
@@ -359,7 +415,7 @@ def _factorization_from_cog(
 ):
     """Build reusable feedback data from a quadratic cost-to-go."""
     zero_inputs = _zero_solve_inputs(inputs)
-    K, _, Phi, _ = _stage_feedback(inputs, zero_inputs, cog)
+    K, _, Phi, _, *_ = _stage_feedback(inputs, zero_inputs, cog)
     P, _, F, Cll, _ = cog
     return output_type(P=P, F=F, Cll=Cll, K=K, Phi=Phi)
 
@@ -384,186 +440,6 @@ def factor_parallel(inputs: FactorizationInputs) -> ParallelFactorizationOutputs
 
 
 
-def _affine_cost_to_go_parallel(
-    inputs: FactorizationInputs,
-    factorization_outputs,
-    solve_inputs: SolveInputs,
-):
-    """Recover RHS-dependent affine cost-to-go terms with an associative scan."""
-    A, B, M, R, D, E = (inputs.A, inputs.B, inputs.M, inputs.R, inputs.D, inputs.E)
-    q, r, c, d = (solve_inputs.q, solve_inputs.r, solve_inputs.c, solve_inputs.d)
-    P, F, Cll = (
-        factorization_outputs.P,
-        factorization_outputs.F,
-        factorization_outputs.Cll,
-    )
-    N, n = A.shape[0], A.shape[1]
-    m, p = B.shape[2], D.shape[1]
-
-    def stage_map(Ak, Bk, Mk, Rk, Dk, Ek, qk, rk, ck1, dk, Pp, Fp, Cllp):
-        Hws = jnp.block(
-            [[Mk + Ak.T @ Pp @ Bk, Ak.T @ Fp.T], [Ek, jnp.zeros((p, p))]]
-        )
-        Hss = jnp.block([[Rk + Bk.T @ Pp @ Bk, Bk.T @ Fp.T], [Fp @ Bk, -Cllp]])
-        Hws_Hss_pinv = Hws @ jnp.linalg.pinv(Hss)
-
-        bw_coeff = jnp.block(
-            [
-                [Ak.T, jnp.zeros((n, p))],
-                [jnp.zeros((p, n)), jnp.zeros((p, p))],
-            ]
-        )
-        bs_coeff = jnp.block(
-            [
-                [Bk.T, jnp.zeros((m, p))],
-                [jnp.zeros((p, n)), -jnp.eye(p)],
-            ]
-        )
-        bhat_coeff = bw_coeff - Hws_Hss_pinv @ bs_coeff
-        Z = jnp.concatenate([bhat_coeff[:n], -bhat_coeff[n:]], axis=0)
-
-        bw_const = jnp.concatenate([qk + Ak.T @ Pp @ ck1, -dk])
-        bs_const = jnp.concatenate([rk + Bk.T @ Pp @ ck1, Fp @ ck1])
-        bhat_const = bw_const - Hws_Hss_pinv @ bs_const
-        z = jnp.concatenate([bhat_const[:n], -bhat_const[n:]])
-        return Z, z
-
-    Z, z = jax.vmap(stage_map)(
-        A, B, M, R, D, E, q[:N], r, c[1:], d, P[1:], F[1:], Cll[1:]
-    )
-
-    def compose(earlier, later):
-        Z1, z1 = earlier
-        Z2, z2 = later
-        return Z2 @ Z1, jnp.einsum("...ij,...j->...i", Z2, z1) + z2
-
-    Z_scan, z_scan = jax.lax.associative_scan(compose, (Z, z), reverse=True)
-    terminal = jnp.concatenate([q[N], jnp.zeros(p, dtype=q.dtype)])
-    affine = jax.vmap(lambda Zk, zk: Zk @ terminal + zk)(Z_scan, z_scan)
-    pv = jnp.concatenate([affine[:, :n], q[N][None]])
-    g = jnp.concatenate([affine[:, n:], jnp.zeros((1, p), dtype=q.dtype)])
-    return P, pv, F, Cll, g
-
-
-def _affine_cost_to_go_sequential(
-    inputs: FactorizationInputs,
-    factorization_outputs,
-    solve_inputs: SolveInputs,
-):
-    """Recover RHS-dependent affine cost-to-go terms from a factorization."""
-    A, B, M, R, D, E = (inputs.A, inputs.B, inputs.M, inputs.R, inputs.D, inputs.E)
-    q, r, c, d = (solve_inputs.q, solve_inputs.r, solve_inputs.c, solve_inputs.d)
-    P, F, Cll = (
-        factorization_outputs.P,
-        factorization_outputs.F,
-        factorization_outputs.Cll,
-    )
-    N, n = A.shape[0], A.shape[1]
-    p = D.shape[1]
-
-    def step(carry, stage):
-        ppv, gp = carry
-        Ak, Bk, Mk, Rk, Dk, Ek, qk, rk, ck1, dk, Pp, Fp, Cllp = stage
-
-        Hws = jnp.block(
-            [[Mk + Ak.T @ Pp @ Bk, Ak.T @ Fp.T], [Ek, jnp.zeros((p, p))]]
-        )
-        Hss = jnp.block([[Rk + Bk.T @ Pp @ Bk, Bk.T @ Fp.T], [Fp @ Bk, -Cllp]])
-        bw = jnp.concatenate([qk + Ak.T @ Pp @ ck1 + Ak.T @ ppv, -dk])
-        bs = jnp.concatenate([rk + Bk.T @ Pp @ ck1 + Bk.T @ ppv, Fp @ ck1 - gp])
-
-        bhat = bw - Hws @ jnp.linalg.pinv(Hss) @ bs
-        new = (bhat[:n], -bhat[n:])
-        return new, new
-
-    terminal = (q[N], jnp.zeros(p, dtype=q.dtype))
-    rev = jax.tree.map(
-        lambda x: x[::-1],
-        (A, B, M, R, D, E, q[:N], r, c[1:], d, P[1:], F[1:], Cll[1:]),
-    )
-    _, outs = jax.lax.scan(step, terminal, rev)
-    outs = jax.tree.map(lambda x: x[::-1], outs)
-    pv = jnp.concatenate([outs[0], terminal[0][None]])
-    g = jnp.concatenate([outs[1], terminal[1][None]])
-    return P, pv, F, Cll, g
-
-
-def _stage_feedforward(
-    inputs: FactorizationInputs,
-    factorization_outputs,
-    solve_inputs: SolveInputs,
-    cog,
-):
-    """Per-stage affine feedforward and closed-loop offset from a factorization."""
-    B, R, D, E = (inputs.B, inputs.R, inputs.D, inputs.E)
-    r, c, d = solve_inputs.r, solve_inputs.c, solve_inputs.d
-    P, pv, F, Cll, g = cog
-    m, p = B.shape[2], D.shape[1]
-
-    def stage(Bk, Rk, Dk, Ek, rk, ck1, dk, Pp, ppv, Fp, Cllp, gp):
-        G = Rk + Bk.T @ Pp @ Bk
-        KKT = jnp.block(
-            [
-                [G, Bk.T @ Fp.T, Ek.T],
-                [Fp @ Bk, -Cllp, jnp.zeros((p, p))],
-                [Ek, jnp.zeros((p, p)), jnp.zeros((p, p))],
-            ]
-        )
-        rhs = jnp.concatenate(
-            [-(Bk.T @ Pp @ ck1 + Bk.T @ ppv + rk), gp - Fp @ ck1, dk]
-        )
-        sol = jnp.linalg.lstsq(KKT, rhs, rcond=None)[0]
-        k = sol[:m]
-        psi = Bk @ k + ck1
-        return k, psi
-
-    return jax.vmap(stage)(
-        B, R, D, E, r, c[1:], d, P[1:], pv[1:], F[1:], Cll[1:], g[1:]
-    )
-
-
-def _forward_primal_from_factorization_sequential(
-    factorization_outputs,
-    solve_inputs: SolveInputs,
-    k,
-    psi,
-):
-    """Sequential forward primal sweep using factored feedback matrices."""
-    K, Phi = factorization_outputs.K, factorization_outputs.Phi
-    x0 = solve_inputs.c[0]
-
-    def step(x_k, stage):
-        K_k, k_k, Phi_k, psi_k = stage
-        u_k = K_k @ x_k + k_k
-        x_k1 = Phi_k @ x_k + psi_k
-        return x_k1, (x_k, u_k)
-
-    x_N, (x_rest, u) = jax.lax.scan(step, x0, (K, k, Phi, psi))
-    x = jnp.concatenate([x_rest, x_N[None]])
-    return x, u
-
-
-def _forward_primal_from_factorization_parallel(
-    factorization_outputs,
-    solve_inputs: SolveInputs,
-    k,
-    psi,
-):
-    """Parallel forward primal sweep using factored feedback matrices."""
-    K, Phi = factorization_outputs.K, factorization_outputs.Phi
-    x0 = solve_inputs.c[0]
-
-    def compose(earlier, later):
-        f1, M1 = earlier
-        f2, M2 = later
-        return (jnp.einsum("...ij,...j->...i", M2, f1) + f2, M2 @ M1)
-
-    composed_psi, composed_Phi = jax.lax.associative_scan(compose, (psi, Phi))
-    x_rest = jax.vmap(lambda Mk, fk: Mk @ x0 + fk)(composed_Phi, composed_psi)
-    x = jnp.concatenate([x0[None], x_rest])
-    u = jax.vmap(lambda K_k, x_k, k_k: K_k @ x_k + k_k)(K, x[:-1], k)
-    return x, u
-
 
 @jax.jit
 def solve(
@@ -572,15 +448,8 @@ def solve(
     solve_inputs: SolveInputs,
 ) -> SolveOutputs:
     """Solve a constrained LQR RHS using a sequential factorization."""
-    cog = _affine_cost_to_go_sequential(
-        factorization_inputs, factorization_outputs, solve_inputs
-    )
-    k, psi = _stage_feedforward(
-        factorization_inputs, factorization_outputs, solve_inputs, cog
-    )
-    x, u = _forward_primal_from_factorization_sequential(
-        factorization_outputs, solve_inputs, k, psi
-    )
+    cog = _cost_to_go_sequential(factorization_inputs, solve_inputs)
+    x, u, _, _, k = _forward_primal_sequential(factorization_inputs, solve_inputs, cog)
     y, lam = _recover_duals(factorization_inputs, solve_inputs, x, u)
     return SolveOutputs(X=x, U=u, Y=y, Lam=lam, p=cog[1], k=k)
 
@@ -591,20 +460,9 @@ def solve_parallel(
     factorization_outputs: ParallelFactorizationOutputs,
     solve_inputs: SolveInputs,
 ) -> SolveOutputs:
-    """Solve a constrained LQR RHS using parallel backward/forward scans.
-
-    The RHS-dependent cost-to-go is recovered by composing affine maps over
-    the factored quadratic blocks, and the primal pass uses an associative scan.
-    """
-    cog = _affine_cost_to_go_parallel(
-        factorization_inputs, factorization_outputs, solve_inputs
-    )
-    k, psi = _stage_feedforward(
-        factorization_inputs, factorization_outputs, solve_inputs, cog
-    )
-    x, u = _forward_primal_from_factorization_parallel(
-        factorization_outputs, solve_inputs, k, psi
-    )
+    """Solve a constrained LQR RHS using the regularized KKT equations."""
+    cog = _cost_to_go_parallel(factorization_inputs, solve_inputs)
+    x, u, _, _, k = _forward_primal_parallel(factorization_inputs, solve_inputs, cog)
     y, lam = _recover_duals(factorization_inputs, solve_inputs, x, u)
     return SolveOutputs(X=x, U=u, Y=y, Lam=lam, p=cog[1], k=k)
 
@@ -615,7 +473,10 @@ def factor_and_solve(
     solve_inputs: SolveInputs,
 ) -> SolveOutputs:
     """Sequential factor + solve; return the KKT point."""
-    return solve(factorization_inputs, factor(factorization_inputs), solve_inputs)
+    cog = _cost_to_go_sequential(factorization_inputs, solve_inputs)
+    x, u, _, _, k = _forward_primal_sequential(factorization_inputs, solve_inputs, cog)
+    y, lam = _recover_duals(factorization_inputs, solve_inputs, x, u)
+    return SolveOutputs(X=x, U=u, Y=y, Lam=lam, p=cog[1], k=k)
 
 
 @jax.jit
@@ -623,11 +484,10 @@ def factor_and_solve_parallel(
     factorization_inputs: FactorizationInputs,
     solve_inputs: SolveInputs,
 ) -> SolveOutputs:
-    """Fully parallel factor + solve; return the KKT point."""
+    """Parallel factor + solve; return the KKT point."""
     cog = _cost_to_go_parallel(factorization_inputs, solve_inputs)
-    x, u = _forward_primal_parallel(factorization_inputs, solve_inputs, cog)
+    x, u, _, _, k = _forward_primal_parallel(factorization_inputs, solve_inputs, cog)
     y, lam = _recover_duals(factorization_inputs, solve_inputs, x, u)
-    _, k, _, _ = _stage_feedback(factorization_inputs, solve_inputs, cog)
     return SolveOutputs(X=x, U=u, Y=y, Lam=lam, p=cog[1], k=k)
 
 

@@ -4,7 +4,7 @@
 
     D_k x_k + E_k u_k = d_k,    k = 0, ..., N-1
 
-with **no dual regularization** (the dynamics are enforced exactly).  There is
+with optional dual regularization.  There is
 no rank requirement on ``D_k`` or ``E_k``: state-only constraints (``E_k = 0``),
 rank-deficient ``E_k`` and ``p > m`` are all supported.  Setting the constraint
 dimension to ``p = 0`` (empty ``D`` / ``E`` / ``d``) recovers the ordinary
@@ -19,11 +19,13 @@ from dataclasses import dataclass
 @jax.tree_util.register_dataclass
 @dataclass
 class FactorizationInputs:
-    """LHS data for a stagewise-constrained LQR problem (no dual regularization).
+    """LHS data for a stagewise-constrained LQR problem.
 
-    Stagewise affine equality constraints ``D_k x_k + E_k u_k = d_k`` are
-    supported for ``k = 0, ..., N-1`` with **arbitrary** ``D_k``, ``E_k`` (no
-    rank requirement); ``p = 0`` gives the unconstrained problem.
+    Stagewise affine equality constraints are supported for ``k = 0, ..., N-1``
+    with **arbitrary** ``D_k``, ``E_k`` (no rank requirement); ``p = 0`` gives
+    the unconstrained problem.  ``Delta`` regularizes dynamics multipliers and
+    ``Sigma`` regularizes stagewise equality multipliers.  Zero blocks recover
+    exact hard equalities.
 
     Shapes (n, m state/control dims; p constraint dim):
         A: [N, n, n],
@@ -32,7 +34,9 @@ class FactorizationInputs:
         M: [N, n, m],
         R: [N, m, m],
         D: [N, p, n],
-        E: [N, p, m].
+        E: [N, p, m],
+        Delta: [N+1, n, n] dynamics dual regularization,
+        Sigma: [N, p, p] constraint dual regularization.
     """
 
     A: jax.Array
@@ -42,6 +46,8 @@ class FactorizationInputs:
     R: jax.Array
     D: jax.Array
     E: jax.Array
+    Delta: jax.Array
+    Sigma: jax.Array
 
 
 @jax.tree_util.register_dataclass
