@@ -1,7 +1,7 @@
 """Shared building blocks for the constrained LQR solver.
 
 All functions here are pure and reusable by both the sequential and parallel
-algorithms in :mod:`lqr_jax.solver`.
+algorithms in :mod:`constrained_lqr_jax.solver`.
 
 There is **no dual regularization** anywhere in this package: the dynamics
 equality ``A_k x_k + B_k u_k + c_{k+1} = x_{k+1}`` is enforced exactly, and the

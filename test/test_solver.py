@@ -16,9 +16,13 @@ import pytest
 from constrained_lqr_jax.types import FactorizationInputs, SolveInputs
 from constrained_lqr_jax.helpers import compute_residual
 from constrained_lqr_jax.solver import (
+    factor,
     factor_and_solve,
     factor_and_solve_parallel,
+    factor_parallel,
+    solve,
     solve_general,
+    solve_parallel,
 )
 
 jax.config.update("jax_enable_x64", True)
@@ -214,6 +218,40 @@ def test_sequential_parallel_agree(name, N, n, m, p, emode):
     np.testing.assert_allclose(s.U, pll.U, atol=1e-7, rtol=1e-6)
     np.testing.assert_allclose(s.Y, pll.Y, atol=1e-7, rtol=1e-6)
     np.testing.assert_allclose(s.Lam, pll.Lam, atol=1e-7, rtol=1e-6)
+
+
+def test_separate_factor_and_solve_matches_factor_and_solve():
+    fac, si = make_problem(17, 5, 3, 2, 1, "mixed")
+
+    seq_fac = factor(fac)
+    seq_sol = solve(fac, seq_fac, si)
+    seq_ref = factor_and_solve(fac, si)
+
+    par_fac = factor_parallel(fac)
+    par_sol = solve_parallel(fac, par_fac, si)
+    par_ref = factor_and_solve_parallel(fac, si)
+
+    np.testing.assert_allclose(seq_sol.X, seq_ref.X, atol=1e-8, rtol=1e-7)
+    np.testing.assert_allclose(seq_sol.U, seq_ref.U, atol=1e-8, rtol=1e-7)
+    np.testing.assert_allclose(par_sol.X, par_ref.X, atol=1e-8, rtol=1e-7)
+    np.testing.assert_allclose(par_sol.U, par_ref.U, atol=1e-8, rtol=1e-7)
+
+
+def test_factorization_can_be_reused_for_multiple_rhs():
+    fac, si0 = make_problem(23, 6, 3, 2, 2, "full")
+    _, si1 = make_problem(29, 6, 3, 2, 2, "full")
+
+    seq_fac = factor(fac)
+    sol0 = solve(fac, seq_fac, si0)
+    sol1 = solve(fac, seq_fac, si1)
+
+    ref0 = factor_and_solve(fac, si0)
+    ref1 = factor_and_solve(fac, si1)
+
+    np.testing.assert_allclose(sol0.X, ref0.X, atol=1e-8, rtol=1e-7)
+    np.testing.assert_allclose(sol0.U, ref0.U, atol=1e-8, rtol=1e-7)
+    np.testing.assert_allclose(sol1.X, ref1.X, atol=1e-8, rtol=1e-7)
+    np.testing.assert_allclose(sol1.U, ref1.U, atol=1e-8, rtol=1e-7)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -28,4 +28,4 @@ test = [
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["regularized_lqr_jax"]
+packages = ["constrained_lqr_jax"]

@@ -1,6 +1,6 @@
 """Data containers for the constrained LQR solver.
 
-``lqr_jax`` solves the *stagewise-constrained* LQR problem
+``constrained_lqr_jax`` solves the *stagewise-constrained* LQR problem
 
     D_k x_k + E_k u_k = d_k,    k = 0, ..., N-1
 
@@ -42,6 +42,43 @@ class FactorizationInputs:
     R: jax.Array
     D: jax.Array
     E: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass
+class SequentialFactorizationOutputs:
+    """Reusable LHS factorization for the sequential constrained LQR solve.
+
+    Shapes (n, m state/control dims; p constraint dim):
+        P:    [N+1, n, n] carried quadratic value matrices,
+        F:    [N+1, p, n] carried constraint Jacobians,
+        Cll:  [N+1, p, p] carried constraint curvature blocks,
+        K:    [N, m, n]   affine feedback matrices,
+        Phi:  [N, n, n]   closed-loop transition matrices.
+    """
+
+    P: jax.Array
+    F: jax.Array
+    Cll: jax.Array
+    K: jax.Array
+    Phi: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass
+class ParallelFactorizationOutputs:
+    """Reusable LHS factorization for the parallel constrained LQR solve.
+
+    The fields have the same meaning and shapes as
+    :class:`SequentialFactorizationOutputs`; only the factorization algorithm
+    differs.
+    """
+
+    P: jax.Array
+    F: jax.Array
+    Cll: jax.Array
+    K: jax.Array
+    Phi: jax.Array
 
 
 @jax.tree_util.register_dataclass
