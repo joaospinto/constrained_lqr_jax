@@ -119,6 +119,68 @@ def _schur_eliminate(H, h, n_outer):
     return H_red, h_red
 
 
+def _solve_mixed_combine_hww(C1, P2, F2, Cll2, B):
+    """Solve the mixed-combine interior system without factoring y1.
+
+    The generic combine eliminates ``w = (z, y1, lambda2)`` through the block
+
+        [[P2, -I, F2.T],
+         [-I, -C1, 0],
+         [F2,  0, -Cll2]].
+
+    Stationarity lets us eliminate ``y1`` algebraically and solve the smaller
+    structured system in ``(z, lambda2)``:
+
+        [[I + C1 P2, C1 F2.T],
+         [F2,        -Cll2   ]].
+
+    ``B`` is a stack of right-hand sides for the full ``w`` system.  The return
+    value has the same shape as ``B`` and equals ``pinv(Hww) @ B`` when the
+    transformed system is consistent.
+    """
+    n = C1.shape[-1]
+    p = F2.shape[-2]
+    batch = C1.shape[:-2]
+    k = B.shape[-1]
+    I = jnp.broadcast_to(jnp.eye(n, dtype=C1.dtype), batch + (n, n))
+
+    bz = B[..., :n, :]
+    by = B[..., n : 2 * n, :]
+    bl = B[..., 2 * n :, :]
+
+    K = jnp.zeros(batch + (n + p, n + p), dtype=C1.dtype)
+    K = K.at[..., :n, :n].set(I + C1 @ P2)
+    K = K.at[..., :n, n:].set(C1 @ jnp.swapaxes(F2, -2, -1))
+    K = K.at[..., n:, :n].set(F2)
+    K = K.at[..., n:, n:].set(-Cll2)
+
+    rhs = jnp.concatenate([C1 @ bz - by, bl], axis=-2)
+    zl = jnp.linalg.pinv(K) @ rhs
+    z = zl[..., :n, :]
+    lam = zl[..., n:, :]
+    y = P2 @ z + jnp.swapaxes(F2, -2, -1) @ lam - bz
+    return jnp.concatenate([z, y, lam], axis=-2)
+
+
+def _schur_eliminate_mixed_combine(H, h, n, p, C1, P2, F2, Cll2):
+    """Schur-eliminate a mixed-IVF combination using the structured solve."""
+    tr = lambda X: jnp.swapaxes(X, -2, -1)
+    o = 3 * n + p
+    Hoo = H[..., :o, :o]
+    How = H[..., :o, o:]
+    ho = h[..., :o]
+    hw = h[..., o:]
+
+    solved = _solve_mixed_combine_hww(
+        C1, P2, F2, Cll2, jnp.concatenate([tr(How), hw[..., None]], axis=-1)
+    )
+    X = solved[..., :-1]
+    xh = solved[..., -1]
+    H_red = Hoo - How @ X
+    h_red = ho - jnp.einsum("...ij,...j->...i", How, xh)
+    return H_red, h_red
+
+
 def mixed_ivf_combine(left, right, n, p):
     """Associative combination of two adjacent mixed IVFs.
 
@@ -188,7 +250,7 @@ def mixed_ivf_combine(left, right, n, p):
     seth(y2, c2)
     seth(l2, -g2)
 
-    Ht, ht = _schur_eliminate(H, h, o)
+    Ht, ht = _schur_eliminate_mixed_combine(H, h, n, p, C1, P2, F2, Cll2)
 
     # read off combined IVF (outer vars x=xi, x'=xk, y=y2, λ=λ1)
     oxi = slice(0, n)
