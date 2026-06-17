@@ -220,35 +220,47 @@ def _stage_feedback(inputs: FactorizationInputs, solve_inputs: SolveInputs, cog)
     m, p = B.shape[2], D.shape[1]
 
     def stage(Ak, Bk, Mk, Rk, Dk, Ek, Deltap, Sigmak, rk, ck1, dk, Pp, ppv, Fp, Cllp, gp):
-        eye_n = jnp.eye(n)
-        eye_p = jnp.eye(p)
-        Z = jnp.block(
-            [
-                [Rk, Bk.T, Ek.T, jnp.zeros((m, p)), jnp.zeros((m, n))],
-                [Bk, -Deltap, jnp.zeros((n, p)), jnp.zeros((n, p)), -eye_n],
-                [Ek, jnp.zeros((p, n)), -Sigmak, jnp.zeros((p, p)), jnp.zeros((p, n))],
-                [jnp.zeros((n, m)), -eye_n, jnp.zeros((n, p)), Fp.T, Pp],
-                [jnp.zeros((p, m)), jnp.zeros((p, n)), jnp.zeros((p, p)), -Cllp, Fp],
-            ]
-        )
-        coeff_x = jnp.concatenate(
-            [
-                -Mk.T,
-                -Ak,
-                -Dk,
-                jnp.zeros((n, n)),
-                jnp.zeros((p, n)),
-            ],
-            axis=0,
-        )
-        const = jnp.concatenate([-rk, -ck1, dk, -ppv, gp])
-        rhs = jnp.concatenate([coeff_x, const[:, None]], axis=1)
-        sol = jnp.linalg.pinv(Z) @ rhs
+        eye_n = jnp.eye(n, dtype=Ak.dtype)
+        Rinv = jnp.linalg.inv(Rk)
+        RiMt = Rinv @ Mk.T
+        RiBt = Rinv @ Bk.T
+        RiEt = Rinv @ Ek.T
+        Rir = Rinv @ rk
 
-        u = sol[:m]
-        y = sol[m : m + n]
-        lam = sol[m + n : m + n + p]
-        xnext = sol[m + n + p + p :]
+        Ao = Ak - Bk @ RiMt
+        Cdyn = Bk @ RiBt + Deltap
+        co = ck1 - Bk @ Rir
+        Cyl = Bk @ RiEt
+        Cll_stage = Ek @ RiEt + Sigmak
+        Fstage = Dk - Ek @ RiMt
+        gstage = dk + Ek @ Rir
+
+        # Unknowns are (x_{k+1}, mu_{k+1}, lambda_k).  The dynamics dual
+        # y_{k+1} and control u_k are reconstructed afterwards.
+        Ksmall = jnp.zeros((n + 2 * p, n + 2 * p), dtype=Ak.dtype)
+        Ksmall = Ksmall.at[:n, :n].set(eye_n + Cdyn @ Pp)
+        Ksmall = Ksmall.at[:n, n : n + p].set(Cdyn @ Fp.T)
+        Ksmall = Ksmall.at[:n, n + p :].set(Cyl)
+        Ksmall = Ksmall.at[n : n + p, :n].set(Cyl.T @ Pp)
+        Ksmall = Ksmall.at[n : n + p, n : n + p].set(Cyl.T @ Fp.T)
+        Ksmall = Ksmall.at[n : n + p, n + p :].set(Cll_stage)
+        Ksmall = Ksmall.at[n + p :, :n].set(Fp)
+        Ksmall = Ksmall.at[n + p :, n : n + p].set(-Cllp)
+
+        coeff_x = jnp.concatenate(
+            [Ao, Fstage, jnp.zeros((p, n), dtype=Ak.dtype)], axis=0
+        )
+        const = jnp.concatenate([co - Cdyn @ ppv, -gstage - Cyl.T @ ppv, gp])
+        rhs = jnp.concatenate([coeff_x, const[:, None]], axis=1)
+        sol = jnp.linalg.lstsq(Ksmall, rhs, rcond=None)[0]
+
+        xnext = sol[:n]
+        mu = sol[n : n + p]
+        lam = sol[n + p :]
+        y = Pp @ xnext + Fp.T @ mu
+        y = y.at[:, n].add(ppv)
+        u_rhs = jnp.concatenate([RiMt, Rir[:, None]], axis=1)
+        u = -(u_rhs + RiBt @ y + RiEt @ lam)
         return (
             u[:, :n],
             u[:, n],
