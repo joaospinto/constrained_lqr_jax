@@ -10,11 +10,12 @@ blocks to zero recovers exact dynamics and exact equality constraints.
 The parallel backward pass is built on the *mixed-constraint interval value
 function* (IVF) — a uniform, fixed-dimension representation of the cost-to-go of
 an interval ``[i, j)`` that **carries the constraint** instead of eliminating
-its multiplier at the base case.  This is what lets a single, branch-free
-associative scan handle arbitrary constraints (state-only ``E = 0``,
-rank-deficient ``E``, ``p > m`` and the full-row-rank / unconstrained cases)
-without any rank requirement.  The construction mirrors ``MixedConstraintIVF``
-in the Lean formalization (see ``MIXED_CONSTRAINT_ANALYSIS.md``).
+its multiplier at the base case.  It supports the generic scan path for mixed
+constraints, rank-deficient ``E``, ``p > m`` and the unconstrained case.  The
+solver adds a separate nullspace-coordinate path for full-row-rank hard
+state-only constraints, whose suffix feasibility domains can exceed this IVF
+carrier.  The construction mirrors ``MixedConstraintIVF`` in the Lean
+formalization (see ``MIXED_CONSTRAINT_ANALYSIS.md``).
 
 A mixed IVF over an interval with entry state ``x`` and exit state ``x'`` is the
 9-component object ``(P, p, A, C, c, Cyl, Cll, F, g)`` representing
@@ -155,11 +156,66 @@ def _solve_mixed_combine_hww(C1, P2, F2, Cll2, B):
     K = K.at[..., n:, n:].set(-Cll2)
 
     rhs = jnp.concatenate([C1 @ bz - by, bl], axis=-2)
-    zl = jnp.linalg.pinv(K) @ rhs
+    if p == 0:
+        zl = jnp.linalg.solve(K, rhs)
+    else:
+        zl = jnp.linalg.pinv(K) @ rhs
     z = zl[..., :n, :]
     lam = zl[..., n:, :]
     y = P2 @ z + jnp.swapaxes(F2, -2, -1) @ lam - bz
     return jnp.concatenate([z, y, lam], axis=-2)
+
+
+def _solve_mixed_terminal_hww(C, QN, DN, SigmaN, B):
+    """Solve the terminal-fold interior system through a smaller Schur block.
+
+    The terminal fold eliminates ``w = (y, xN, nu)`` through
+
+        [[-C, -I, 0],
+         [-I, QN, DN.T],
+         [ 0, DN, -SigmaN]].
+
+    The first row gives ``xN = -C y - b_y``.  Substituting into the remaining
+    rows leaves an ``(n+p)`` system in ``(y, nu)``, avoiding a larger pseudo-
+    inverse for every folded suffix.
+    """
+    n = C.shape[-1]
+    p = DN.shape[-2]
+    batch = C.shape[:-2]
+    dtype = C.dtype
+    I = jnp.broadcast_to(jnp.eye(n, dtype=dtype), batch + (n, n))
+
+    by = B[..., :n, :]
+    bx = B[..., n : 2 * n, :]
+    bnu = B[..., 2 * n :, :]
+
+    def active_terminal(_):
+        K = jnp.zeros(batch + (n + p, n + p), dtype=dtype)
+        K = K.at[..., :n, :n].set(I + QN @ C)
+        K = K.at[..., :n, n:].set(-jnp.swapaxes(DN, -2, -1))
+        K = K.at[..., n:, :n].set(DN @ C)
+        K = K.at[..., n:, n:].set(SigmaN)
+
+        rhs = jnp.concatenate([-(bx + QN @ by), -(bnu + DN @ by)], axis=-2)
+        ynu = jnp.linalg.pinv(K) @ rhs
+        y = ynu[..., :n, :]
+        nu = ynu[..., n:, :]
+        xN = -(C @ y + by)
+        return jnp.concatenate([y, xN, nu], axis=-2)
+
+    def inactive_terminal(_):
+        Ky = I + QN @ C
+        y = jnp.linalg.solve(Ky, -(bx + QN @ by))
+        xN = -(C @ y + by)
+        nu = jnp.zeros(batch + (p, B.shape[-1]), dtype=dtype)
+        return jnp.concatenate([y, xN, nu], axis=-2)
+
+    return jax.lax.cond(
+        jnp.all(DN == 0) & jnp.all(SigmaN == 0),
+        inactive_terminal,
+        active_terminal,
+        operand=None,
+    )
 
 
 def _schur_eliminate_mixed_combine(H, h, n, p, C1, P2, F2, Cll2):
@@ -194,77 +250,69 @@ def mixed_ivf_combine(left, right, n, p):
     P1, p1, A1, C1, c1, Cyl1, Cll1, F1, g1 = left
     P2, p2, A2, C2, c2, Cyl2, Cll2, F2, g2 = right
     batch = P1.shape[:-2]
-    I = jnp.broadcast_to(jnp.eye(n), batch + (n, n))
+    dtype = P1.dtype
     tr = lambda X: jnp.swapaxes(X, -2, -1)
 
     # outer o = [xi(n), xk(n), y2(n), λ1(p)] ; interior w = [z(n), y1(n), λ2(p)]
     o = 3 * n + p
-    D = 5 * n + 2 * p
     xi = slice(0, n)
-    xk = slice(n, 2 * n)
     y2 = slice(2 * n, 3 * n)
     l1 = slice(3 * n, 3 * n + p)
-    z = slice(3 * n + p, 4 * n + p)
-    y1 = slice(4 * n + p, 5 * n + p)
-    l2 = slice(5 * n + p, 5 * n + 2 * p)
+    z = slice(0, n)
+    y1 = slice(n, 2 * n)
+    l2 = slice(2 * n, 2 * n + p)
 
-    H = jnp.zeros(batch + (D, D))
-    h = jnp.zeros(batch + (D,))
+    zero_nn = jnp.zeros(batch + (n, n), dtype=dtype)
+    zero_np = jnp.zeros(batch + (n, p), dtype=dtype)
+    zero_pn = jnp.zeros(batch + (p, n), dtype=dtype)
+    zero_pp = jnp.zeros(batch + (p, p), dtype=dtype)
 
-    def setH(a, b, val):
-        nonlocal H
-        H = H.at[..., a, b].add(val)
+    # Build H_wo and h_w directly.  The outer xk column is zero because xk only
+    # couples to the carried y2 block, which is kept explicit in the IVF form.
+    z_rhs = jnp.concatenate(
+        [zero_nn, zero_nn, tr(A2), zero_np, p2[..., None]], axis=-1
+    )
+    y1_rhs = jnp.concatenate(
+        [A1, zero_nn, zero_nn, -Cyl1, c1[..., None]], axis=-1
+    )
+    l2_rhs = jnp.concatenate(
+        [zero_pn, zero_pn, -tr(Cyl2), zero_pp, -g2[..., None]], axis=-1
+    )
+    rhs = jnp.concatenate([z_rhs, y1_rhs, l2_rhs], axis=-2)
+    solved = _solve_mixed_combine_hww(
+        C1,
+        P2,
+        F2,
+        Cll2,
+        rhs,
+    )
+    X = solved[..., :-1]
+    xh = solved[..., -1]
+    X_z = X[..., z, :]
+    X_y1 = X[..., y1, :]
+    X_l2 = X[..., l2, :]
+    xh_z = xh[..., z]
+    xh_y1 = xh[..., y1]
+    xh_l2 = xh[..., l2]
 
-    def seth(a, val):
-        nonlocal h
-        h = h.at[..., a].add(val)
+    schur_xi = tr(A1) @ X_y1
+    schur_y2 = A2 @ X_z - Cyl2 @ X_l2
+    schur_l1 = -tr(Cyl1) @ X_y1
+    schurh_xi = jnp.einsum("...ij,...j->...i", tr(A1), xh_y1)
+    schurh_y2 = jnp.einsum(
+        "...ij,...j->...i", A2, xh_z
+    ) - jnp.einsum("...ij,...j->...i", Cyl2, xh_l2)
+    schurh_l1 = -jnp.einsum("...ij,...j->...i", tr(Cyl1), xh_y1)
 
-    # left IVF: x=xi, x'=z, y=y1, λ=λ1
-    setH(xi, xi, P1)
-    setH(y1, xi, A1)
-    setH(xi, y1, tr(A1))
-    setH(y1, z, -I)
-    setH(z, y1, -I)
-    setH(y1, y1, -C1)
-    setH(y1, l1, -Cyl1)
-    setH(l1, y1, -tr(Cyl1))
-    setH(l1, xi, F1)
-    setH(xi, l1, tr(F1))
-    setH(l1, l1, -Cll1)
-    seth(xi, p1)
-    seth(y1, c1)
-    seth(l1, -g1)
-    # right IVF: x=z, x'=xk, y=y2, λ=λ2
-    setH(z, z, P2)
-    setH(y2, z, A2)
-    setH(z, y2, tr(A2))
-    setH(y2, xk, -I)
-    setH(xk, y2, -I)
-    setH(y2, y2, -C2)
-    setH(y2, l2, -Cyl2)
-    setH(l2, y2, -tr(Cyl2))
-    setH(l2, z, F2)
-    setH(z, l2, tr(F2))
-    setH(l2, l2, -Cll2)
-    seth(z, p2)
-    seth(y2, c2)
-    seth(l2, -g2)
-
-    Ht, ht = _schur_eliminate_mixed_combine(H, h, n, p, C1, P2, F2, Cll2)
-
-    # read off combined IVF (outer vars x=xi, x'=xk, y=y2, λ=λ1)
-    oxi = slice(0, n)
-    oy = slice(2 * n, 3 * n)
-    ol = slice(3 * n, 3 * n + p)
-    P = symmetrize(Ht[..., oxi, oxi])
-    A = Ht[..., oy, oxi]
-    C = symmetrize(-Ht[..., oy, oy])
-    Cyl = -Ht[..., oy, ol]
-    Cll = symmetrize(-Ht[..., ol, ol])
-    F = Ht[..., ol, oxi]
-    pv = ht[..., oxi]
-    cc = ht[..., oy]
-    g = -ht[..., ol]
+    P = symmetrize(P1 - schur_xi[..., xi])
+    A = -schur_y2[..., xi]
+    C = symmetrize(C2 + schur_y2[..., y2])
+    Cyl = schur_y2[..., l1]
+    Cll = symmetrize(Cll1 + schur_l1[..., l1])
+    F = F1 - schur_l1[..., xi]
+    pv = p1 - schurh_xi
+    cc = c2 - schurh_y2
+    g = g1 + schurh_l1
     return P, pv, A, C, cc, Cyl, Cll, F, g
 
 
@@ -279,62 +327,42 @@ def mixed_ivf_fold_terminal(ivf, Q_N, q_N, D_N, Sigma_N, d_N, n, p):
     """
     P, pv, A, C, c, Cyl, Cll, F, g = ivf
     batch = P.shape[:-2]
-    I = jnp.broadcast_to(jnp.eye(n), batch + (n, n))
+    dtype = P.dtype
     tr = lambda X: jnp.swapaxes(X, -2, -1)
 
-    # outer o = [xk(n), λ(p)] ; interior w = [y(n), xN(n), ν(p)]
-    o = n + p
-    Dd = 3 * n + 2 * p
-    xk = slice(0, n)
-    ll = slice(n, n + p)
-    y = slice(n + p, 2 * n + p)
-    xN = slice(2 * n + p, 3 * n + p)
-    nu = slice(3 * n + p, 3 * n + 2 * p)
+    # outer o = [xk(n), λ(p)] ; interior w = [y(n), xN(n), ν(p)].
+    # The only nonzero outer/interior coupling is in the y row, so assemble the
+    # right-hand sides directly instead of scattering into Hoo/How.
+    zero_no = jnp.zeros(batch + (n, n + p), dtype=dtype)
+    zero_po = jnp.zeros(batch + (p, n + p), dtype=dtype)
+    how = jnp.concatenate([A, -Cyl], axis=-1)
+    B = jnp.concatenate(
+        [
+            jnp.concatenate([how, c[..., None]], axis=-1),
+            jnp.concatenate([zero_no, q_N[..., None]], axis=-1),
+            jnp.concatenate([zero_po, -d_N[..., None]], axis=-1),
+        ],
+        axis=-2,
+    )
+    solved = _solve_mixed_terminal_hww(
+        C,
+        Q_N,
+        D_N,
+        Sigma_N,
+        B,
+    )
+    X = solved[..., :-1]
+    xh = solved[..., -1]
+    X_y = X[..., :n, :]
+    xh_y = xh[..., :n]
 
-    H = jnp.zeros(batch + (Dd, Dd))
-    h = jnp.zeros(batch + (Dd,))
-
-    def setH(a, b, val):
-        nonlocal H
-        H = H.at[..., a, b].add(val)
-
-    def seth(a, val):
-        nonlocal h
-        h = h.at[..., a].add(val)
-
-    # IVF: x=xk, x'=xN, y=y, λ=λ
-    setH(xk, xk, P)
-    setH(y, xk, A)
-    setH(xk, y, tr(A))
-    setH(y, xN, -I)
-    setH(xN, y, -I)
-    setH(y, y, -C)
-    setH(y, ll, -Cyl)
-    setH(ll, y, -tr(Cyl))
-    setH(ll, xk, F)
-    setH(xk, ll, tr(F))
-    setH(ll, ll, -Cll)
-    seth(xk, pv)
-    seth(y, c)
-    seth(ll, -g)
-    # terminal cost on xN
-    setH(xN, xN, Q_N)
-    seth(xN, q_N)
-    # terminal constraint on xN
-    setH(nu, xN, D_N)
-    setH(xN, nu, tr(D_N))
-    setH(nu, nu, -Sigma_N)
-    seth(nu, -d_N)
-
-    Ht, ht = _schur_eliminate(H, h, o)
-
-    oxk = slice(0, n)
-    ol = slice(n, n + p)
-    P_new = symmetrize(Ht[..., oxk, oxk])
-    F_new = Ht[..., ol, oxk]
-    Cll_new = symmetrize(-Ht[..., ol, ol])
-    p_new = ht[..., oxk]
-    g_new = -ht[..., ol]
+    schur_H = tr(how) @ X_y
+    schur_h = jnp.einsum("...ij,...j->...i", tr(how), xh_y)
+    P_new = symmetrize(P - schur_H[..., :n, :n])
+    F_new = F - schur_H[..., n:, :n]
+    Cll_new = symmetrize(Cll + schur_H[..., n:, n:])
+    p_new = pv - schur_h[..., :n]
+    g_new = g + schur_h[..., n:]
     return P_new, p_new, F_new, Cll_new, g_new
 
 

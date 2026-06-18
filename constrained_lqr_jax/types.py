@@ -6,10 +6,10 @@
     D_N x_N         = d_N
 
 with optional dual regularization.  There is
-no rank requirement on ``D_k`` or ``E_k``: state-only constraints (``E_k = 0``),
-rank-deficient ``E_k`` and ``p > m`` are all supported.  Setting the constraint
-dimension to ``p = 0`` (empty ``D`` / ``E`` / ``d``) recovers the ordinary
-unconstrained LQR problem with no separate code path.
+no shape restriction beyond the fixed stagewise dimensions; state-only
+constraints (``E_k = 0``), rank-deficient ``E_k`` and ``p > m`` are represented.
+Setting the constraint dimension to ``p = 0`` (empty ``D`` / ``E`` / ``d``)
+recovers the ordinary unconstrained LQR problem with no separate code path.
 """
 
 import jax
@@ -22,12 +22,11 @@ from dataclasses import dataclass
 class FactorizationInputs:
     """LHS data for a stagewise-constrained LQR problem.
 
-    Equality constraints are supported for ``k = 0, ..., N`` with **arbitrary**
-    ``D_k`` and stagewise ``E_k`` for ``k < N`` (no rank requirement);
-    terminal constraints use only ``D_N x_N = d_N``. ``p = 0`` gives the
-    unconstrained problem.  ``Delta`` regularizes dynamics multipliers and
-    ``Sigma`` regularizes equality multipliers. Zero blocks recover exact hard
-    equalities.
+    Equality constraints are stored for ``k = 0, ..., N`` with stagewise
+    ``D_k`` and ``E_k`` for ``k < N``; terminal constraints use only
+    ``D_N x_N = d_N``. ``p = 0`` gives the unconstrained problem. ``Delta``
+    regularizes dynamics multipliers and ``Sigma`` regularizes equality
+    multipliers. Zero blocks recover exact hard equalities.
 
     Shapes (n, m state/control dims; p constraint dim):
         A: [N, n, n],
@@ -57,12 +56,20 @@ class FactorizationInputs:
 class SequentialFactorizationOutputs:
     """Reusable LHS factorization for the sequential constrained LQR solve.
 
+    These fields contain RHS-independent quadratic/feedback data and a
+    structured dual-recovery cache.  The current public ``solve`` path still
+    recomputes RHS-dependent primal affine recurrences from ``SolveInputs``;
+    this object is therefore a partial LHS cache, not a complete symbolic
+    factorization of every solve-time quantity.
+
     Shapes (n, m state/control dims; p constraint dim):
         P:    [N+1, n, n] carried quadratic value matrices,
         F:    [N+1, p, n] carried constraint Jacobians,
         Cll:  [N+1, p, p] carried constraint curvature blocks,
         K:    [N, m, n]   affine feedback matrices,
         Phi:  [N, n, n]   closed-loop transition matrices.
+        dual_recovery:
+              RHS-independent structured data for multiplier recovery.
     """
 
     P: jax.Array
@@ -70,6 +77,7 @@ class SequentialFactorizationOutputs:
     Cll: jax.Array
     K: jax.Array
     Phi: jax.Array
+    dual_recovery: object
 
 
 @jax.tree_util.register_dataclass
@@ -79,7 +87,8 @@ class ParallelFactorizationOutputs:
 
     The fields have the same meaning and shapes as
     :class:`SequentialFactorizationOutputs`; only the factorization algorithm
-    differs.
+    differs.  As above, solve-time affine recurrences are recomputed from the
+    RHS.
     """
 
     P: jax.Array
@@ -87,6 +96,7 @@ class ParallelFactorizationOutputs:
     Cll: jax.Array
     K: jax.Array
     Phi: jax.Array
+    dual_recovery: object
 
 
 @jax.tree_util.register_dataclass
