@@ -24,13 +24,13 @@ The solver handles
   * the full-row-rank case, and
   * the unconstrained problem (``p = 0``, empty ``D`` / ``E`` / ``d``),
 
-with fixed-size local algebra and no horizon-sized dense solve.  Hard
-state-only constraints with full-row-rank ``D_k`` use a nullspace-coordinate
-path, because their exact suffix feasibility domain can have more rows than the
-mixed-IVF ``F x = g`` carrier can represent.  Other cases use the
-constraint-carrying / "mixed" interval value function (formalized in
-``MixedConstraintIVF.lean``), which carries constraints through the cost-to-go
-rather than eliminating the constraint multiplier at the base case.
+with fixed-size local algebra and no horizon-sized dense solve.  The default
+path uses the constraint-carrying / "mixed" interval value function, which
+carries constraints through the cost-to-go rather than eliminating the
+constraint multiplier at the base case.  Hard state-only cases with more
+constraints than controls first use an endpoint-domain scan to represent suffix
+feasibility domains explicitly, then solve a projected problem with the same
+scan-native LQR machinery.
 
 Algorithms
 ----------
@@ -59,7 +59,6 @@ zero regularization, an infeasible hard-constrained problem yields
 
 References:
   - Sousa-Pinto & Orban, "Dual-Regularized Riccati Recursions"
-  - MixedConstraintIVF.lean / MIXED_CONSTRAINT_ANALYSIS.md in this project
 """
 
 from __future__ import annotations
@@ -762,37 +761,7 @@ def _compress_relation(E, rhs, rows):
     return H, h
 
 
-def _state_only_domain_base(inputs, solve_inputs):
-    """Base endpoint-domain relations for hard state-only constraints.
-
-    Each interval relation has fixed shape ``2n``:
-
-        H_left[k] x_k + H_right[k] x_{k+1} = h[k].
-
-    The rows encode the current state constraint plus the one-step reachability
-    condition after eliminating ``u_k``.
-    """
-    A, B, D = inputs.A, inputs.B, inputs.D
-    c, d = solve_inputs.c, solve_inputs.d
-    N, n = A.shape[0], A.shape[1]
-    p = D.shape[1]
-    dtype = jnp.result_type(A, B, D, c, d)
-
-    def one(Ak, Bk, Dk, ck1, dk):
-        PB = jnp.eye(n, dtype=dtype) - Bk @ jnp.linalg.pinv(Bk)
-        pad_rows = n - p
-        zero_pn = jnp.zeros((p, n), dtype=dtype)
-        zero_pad_n = jnp.zeros((pad_rows, n), dtype=dtype)
-        zero_pad = jnp.zeros((pad_rows,), dtype=dtype)
-        H_left = jnp.concatenate([Dk, -PB @ Ak, zero_pad_n], axis=0)
-        H_right = jnp.concatenate([zero_pn, PB, zero_pad_n], axis=0)
-        h = jnp.concatenate([dk, PB @ ck1, zero_pad], axis=0)
-        return H_left, H_right, h
-
-    return jax.vmap(one)(A, B, D[:N], c[1:], d[:N])
-
-
-def _state_only_domain_combine(left, right):
+def _endpoint_domain_combine(left, right):
     """Associatively combine adjacent endpoint-domain relations."""
     L_i, L_z, h_l = left
     R_z, R_j, h_r = right
@@ -817,7 +786,7 @@ def _state_only_domain_combine(left, right):
     return compressed[..., :n], compressed[..., n:], h
 
 
-def _state_only_domain_fold_terminal(interval, D_N, d_N):
+def _endpoint_domain_fold_terminal(interval, D_N, d_N):
     """Fold terminal state constraints into an endpoint-domain relation."""
     H_left, H_terminal, h_interval = interval
     n = H_left.shape[-1]
@@ -836,22 +805,56 @@ def _state_only_domain_fold_terminal(interval, D_N, d_N):
     return _compress_relation(projector @ endpoint, projected_rhs, n)
 
 
-def _state_only_suffix_domains_parallel(inputs, solve_inputs):
-    """Compute hard state-only suffix feasibility domains in O(log N) depth.
+def _endpoint_domain_base(inputs, solve_inputs):
+    """Base endpoint-domain relations for hard stage constraints.
 
-    Returns ``(H, h)`` with ``H[k] x_k = h[k]`` describing the exact endpoint
-    domain for suffix ``[k, N]`` up to row-space basis choices.
+    Each interval relation has fixed shape ``2n``:
+
+        H_left[k] x_k + H_right[k] x_{k+1} = h[k].
+
+    The rows encode the existence of a control ``u_k`` satisfying both the
+    dynamics and the stage equality constraints.
     """
+    A, B, D, E = inputs.A, inputs.B, inputs.D, inputs.E
+    c, d = solve_inputs.c, solve_inputs.d
+    N, n = A.shape[0], A.shape[1]
+    p = D.shape[1]
+    dtype = jnp.result_type(A, B, D, E, c, d)
+
+    def one(Ak, Bk, Dk, Ek, ck1, dk):
+        Z = jnp.concatenate([Ek, -Bk], axis=0)
+        endpoint = jnp.concatenate(
+            [
+                jnp.concatenate(
+                    [Dk, jnp.zeros((p, n), dtype=dtype)], axis=1
+                ),
+                jnp.concatenate([-Ak, jnp.eye(n, dtype=dtype)], axis=1),
+            ],
+            axis=0,
+        )
+        rhs = jnp.concatenate([dk, ck1])
+        projector = jnp.eye(p + n, dtype=dtype) - Z @ jnp.linalg.pinv(Z)
+        projected_rhs = projector @ rhs
+        compressed, h = _compress_relation(
+            projector @ endpoint, projected_rhs, 2 * n
+        )
+        return compressed[..., :n], compressed[..., n:], h
+
+    return jax.vmap(one)(A, B, D[:N], E, c[1:], d[:N])
+
+
+def _suffix_domains_parallel(inputs, solve_inputs):
+    """Compute hard-constraint suffix feasibility domains in O(log N) depth."""
     A = inputs.A
     N, n = A.shape[0], A.shape[1]
-    base = _state_only_domain_base(inputs, solve_inputs)
+    base = _endpoint_domain_base(inputs, solve_inputs)
     rev = jax.tree.map(lambda x: x[::-1], base)
     scanned_rev = jax.lax.associative_scan(
-        lambda acc, new: _state_only_domain_combine(new, acc), rev
+        lambda acc, new: _endpoint_domain_combine(new, acc), rev
     )
     scanned = jax.tree.map(lambda x: x[::-1], scanned_rev)
     H, h = jax.vmap(
-        lambda interval: _state_only_domain_fold_terminal(
+        lambda interval: _endpoint_domain_fold_terminal(
             interval, inputs.D[N], solve_inputs.d[N]
         )
     )(scanned)
@@ -861,159 +864,37 @@ def _state_only_suffix_domains_parallel(inputs, solve_inputs):
     )
 
 
-def _use_hard_state_only_nullspace_path(inputs):
+def _use_hard_projected_path(inputs):
     p = inputs.D.shape[1]
-    n = inputs.A.shape[1]
-    if not (0 < p < n):
-        return False
-    singular_values = jnp.linalg.svd(inputs.D[1:], compute_uv=False)
-    full_row_rank = jnp.all(
-        singular_values[..., -1]
-        > 100 * jnp.finfo(inputs.D.dtype).eps * jnp.maximum(n, p)
-    )
+    m = inputs.B.shape[2]
+    # The generic mixed-IVF path is faster and passes the tested hard mixed and
+    # smaller state-only cases.  The projected path covers the hard state-only
+    # p > m regime where local control elimination cannot carry the full domain.
     return (
-        jnp.all(inputs.E == 0)
+        (p > m)
+        & jnp.all(inputs.E == 0)
         & jnp.all(inputs.Delta == 0)
         & jnp.all(inputs.Sigma == 0)
-        & full_row_rank
     )
 
 
-def _use_hard_state_only_projected_path(inputs):
-    p = inputs.D.shape[1]
-    n = inputs.A.shape[1]
-    if not (0 < p < n):
-        return False
-    singular_values = jnp.linalg.svd(inputs.D[1:], compute_uv=False)
-    full_row_rank = jnp.all(
-        singular_values[..., -1]
-        > 100 * jnp.finfo(inputs.D.dtype).eps * jnp.maximum(n, p)
+def _hard_projected_solve(inputs, solve_inputs, parallel: bool):
+    """Solve hard constraints by projecting onto suffix feasibility domains."""
+    A, B, Q, M, R, D, E = (
+        inputs.A,
+        inputs.B,
+        inputs.Q,
+        inputs.M,
+        inputs.R,
+        inputs.D,
+        inputs.E,
     )
-    return (
-        jnp.all(inputs.E == 0)
-        & jnp.all(inputs.Delta == 0)
-        & jnp.all(inputs.Sigma == 0)
-        & ~full_row_rank
-    )
-
-
-def _hard_state_only_nullspace_solve(inputs, solve_inputs, parallel: bool):
-    """Solve hard state-only constraints by reducing to nullspace coordinates.
-
-    For ``E = 0`` and unregularized hard constraints, each constrained state is
-    written as ``x_k = xbar_k + Z_k z_k``.  Feasibility of the next state becomes
-    a stagewise control-coupled constraint in the reduced coordinates, so the
-    existing scan solver can be used without relying on singular local IVF
-    pseudo-inverses to represent the hard domain.
-    """
-    A, B, Q, M, R, D = inputs.A, inputs.B, inputs.Q, inputs.M, inputs.R, inputs.D
     q, r, c, d = solve_inputs.q, solve_inputs.r, solve_inputs.c, solve_inputs.d
     N, n = A.shape[0], A.shape[1]
     p = D.shape[1]
-    zdim = n - p
-    dtype = jnp.result_type(A, B, Q, M, R, D, q, r, c, d)
+    dtype = jnp.result_type(A, B, Q, M, R, D, E, q, r, c, d)
 
-    def affine_state_subspace(Dk, dk):
-        _, _, vh = jnp.linalg.svd(Dk, full_matrices=True)
-        Zk = jnp.swapaxes(vh[p:], -2, -1)
-        Wk = jnp.swapaxes(vh[:p], -2, -1)
-        xbar_k = jnp.linalg.pinv(Dk) @ dk
-        return Zk, Wk, xbar_k
-
-    Z, W, xbar = jax.vmap(affine_state_subspace)(D, d)
-    Z = Z.at[0].set(jnp.zeros((n, zdim), dtype=dtype))
-    W = W.at[0].set(jnp.zeros((n, p), dtype=dtype))
-    xbar = xbar.at[0].set(c[0])
-
-    Zk = Z[:N]
-    Zkp1 = Z[1:]
-    Wkp1 = W[1:]
-    xbar_k = xbar[:N]
-    xbar_kp1 = xbar[1:]
-
-    Qz = jax.vmap(lambda Zj, Qj: Zj.T @ Qj @ Zj)(Z, Q)
-    qz = jax.vmap(lambda Zj, Qj, qj, xj: Zj.T @ (Qj @ xj + qj))(
-        Z, Q, q, xbar
-    )
-    Mz = jax.vmap(lambda Zj, Mj: Zj.T @ Mj)(Zk, M)
-    rz = jax.vmap(lambda Mj, xj, rj: Mj.T @ xj + rj)(M, xbar_k, r)
-
-    transition_offset = jax.vmap(lambda Aj, xj, cj, xj1: Aj @ xj + cj - xj1)(
-        A, xbar_k, c[1:], xbar_kp1
-    )
-    Az = jax.vmap(lambda Zj1, Aj, Zj: Zj1.T @ Aj @ Zj)(Zkp1, A, Zk)
-    Bz = jax.vmap(lambda Zj1, Bj: Zj1.T @ Bj)(Zkp1, B)
-    cz = jax.vmap(lambda Zj1, off: Zj1.T @ off)(Zkp1, transition_offset)
-
-    Dz_stage = jax.vmap(lambda Wj1, Aj, Zj: Wj1.T @ Aj @ Zj)(Wkp1, A, Zk)
-    Ez = jax.vmap(lambda Wj1, Bj: Wj1.T @ Bj)(Wkp1, B)
-    dz_stage = -jax.vmap(lambda Wj1, off: Wj1.T @ off)(
-        Wkp1, transition_offset
-    )
-    Dz = jnp.concatenate(
-        [Dz_stage, jnp.zeros((1, p, zdim), dtype=dtype)], axis=0
-    )
-    dz = jnp.concatenate([dz_stage, jnp.zeros((1, p), dtype=dtype)], axis=0)
-
-    reduced_inputs = FactorizationInputs(
-        A=Az,
-        B=Bz,
-        Q=Qz,
-        M=Mz,
-        R=R,
-        D=Dz,
-        E=Ez,
-        Delta=jnp.zeros((N + 1, zdim, zdim), dtype=dtype),
-        Sigma=jnp.zeros((N + 1, p, p), dtype=dtype),
-    )
-    reduced_solve_inputs = SolveInputs(
-        q=qz,
-        r=rz,
-        c=jnp.concatenate(
-            [jnp.zeros((1, zdim), dtype=dtype), cz],
-            axis=0,
-        ),
-        d=dz,
-    )
-
-    if parallel:
-        cog = _cost_to_go_parallel(reduced_inputs, reduced_solve_inputs)
-        z, u, _, _, _ = _forward_primal_parallel(
-            reduced_inputs, reduced_solve_inputs, cog
-        )
-    else:
-        cog = _cost_to_go_sequential(reduced_inputs, reduced_solve_inputs)
-        z, u, _, _, _ = _forward_primal_sequential(
-            reduced_inputs, reduced_solve_inputs, cog
-        )
-
-    x = jax.vmap(lambda Zj, zj, xj: Zj @ zj + xj)(Z, z, xbar)
-    y, lam = _recover_duals(inputs, solve_inputs, x, u)
-    return SolveOutputs(
-        X=x,
-        U=u,
-        Y=y,
-        Lam=lam,
-        p=jnp.zeros_like(q),
-        k=jnp.zeros_like(r),
-    )
-
-
-def _hard_state_only_projected_solve(inputs, solve_inputs, parallel: bool):
-    """Solve hard state-only constraints using scanned suffix domains.
-
-    This path handles rank-deficient ``D`` rows.  It first computes the exact
-    suffix feasibility domain ``H_k x_k = h_k`` with an associative endpoint
-    relation scan, then writes ``x_k = xbar_k + P_k z_k`` where ``P_k`` projects
-    onto ``null(H_k)``.  Dynamics feasibility outside the next suffix domain is
-    added as a control-coupled stage constraint in the transformed problem.
-    """
-    A, B, Q, M, R, D = inputs.A, inputs.B, inputs.Q, inputs.M, inputs.R, inputs.D
-    q, r, c, d = solve_inputs.q, solve_inputs.r, solve_inputs.c, solve_inputs.d
-    N, n = A.shape[0], A.shape[1]
-    dtype = jnp.result_type(A, B, Q, M, R, D, q, r, c, d)
-
-    H, h = _state_only_suffix_domains_parallel(inputs, solve_inputs)
+    H, h = _suffix_domains_parallel(inputs, solve_inputs)
     Hpinv = jax.vmap(jnp.linalg.pinv)(H)
     xbar = jax.vmap(lambda Hp, hk: Hp @ hk)(Hpinv, h)
     P = jnp.eye(n, dtype=dtype)[None] - Hpinv @ H
@@ -1040,15 +921,35 @@ def _hard_state_only_projected_solve(inputs, solve_inputs, parallel: bool):
     cz = jax.vmap(lambda Pj1, off: Pj1 @ off)(Pnext, offset)
 
     complement = jnp.eye(n, dtype=dtype)[None] - Pnext
-    Dz_stage = jax.vmap(lambda Cj, Aj, Pj: Cj @ (Aj @ Pj))(
+    Dz_eq = jax.vmap(lambda Dk, Pj: Dk @ Pj)(D[:N], Pk)
+    Ez_eq = E
+    dz_eq = jax.vmap(lambda dk, Dk, xj: dk - Dk @ xj)(d[:N], D[:N], xbar_k)
+    Dz_domain = jax.vmap(lambda Cj, Aj, Pj: Cj @ (Aj @ Pj))(
         complement, A, Pk
     )
-    Ez = jax.vmap(lambda Cj, Bj: Cj @ Bj)(complement, B)
-    dz_stage = -jax.vmap(lambda Cj, off: Cj @ off)(complement, offset)
-    Dz = jnp.concatenate(
-        [Dz_stage, jnp.zeros((1, n, n), dtype=dtype)], axis=0
+    Ez_domain = jax.vmap(lambda Cj, Bj: Cj @ Bj)(complement, B)
+    dz_domain = -jax.vmap(lambda Cj, off: Cj @ off)(complement, offset)
+
+    Dz_stage = jnp.concatenate([Dz_eq, Dz_domain], axis=1)
+    Ez_stage = jnp.concatenate([Ez_eq, Ez_domain], axis=1)
+    dz_stage = jnp.concatenate([dz_eq, dz_domain], axis=1)
+
+    q_constraints = n
+
+    def compress_stage(Dk, Ek, dk):
+        relation = jnp.concatenate([Dk, Ek], axis=1)
+        Hk, hk = _compress_relation(relation, dk, q_constraints)
+        return Hk[:, :n], Hk[:, n:], hk
+
+    Dz_stage, Ez, dz_stage = jax.vmap(compress_stage)(
+        Dz_stage, Ez_stage, dz_stage
     )
-    dz = jnp.concatenate([dz_stage, jnp.zeros((1, n), dtype=dtype)], axis=0)
+    Dz = jnp.concatenate(
+        [Dz_stage, jnp.zeros((1, q_constraints, n), dtype=dtype)], axis=0
+    )
+    dz = jnp.concatenate(
+        [dz_stage, jnp.zeros((1, q_constraints), dtype=dtype)], axis=0
+    )
 
     reduced_inputs = FactorizationInputs(
         A=Az,
@@ -1059,7 +960,7 @@ def _hard_state_only_projected_solve(inputs, solve_inputs, parallel: bool):
         D=Dz,
         E=Ez,
         Delta=jnp.zeros((N + 1, n, n), dtype=dtype),
-        Sigma=jnp.zeros((N + 1, n, n), dtype=dtype),
+        Sigma=jnp.zeros((N + 1, q_constraints, q_constraints), dtype=dtype),
     )
     reduced_solve_inputs = SolveInputs(
         q=qz,
@@ -1163,30 +1064,15 @@ def solve(
     solve_inputs: SolveInputs,
 ) -> SolveOutputs:
     """Solve a constrained LQR RHS using a sequential factorization."""
-    p = factorization_inputs.D.shape[1]
-    n = factorization_inputs.A.shape[1]
-    if not (0 < p < n):
-        return _solve_generic(
+    return jax.lax.cond(
+        _use_hard_projected_path(factorization_inputs),
+        lambda _: _hard_projected_solve(
+            factorization_inputs, solve_inputs, parallel=False
+        ),
+        lambda _: _solve_generic(
             factorization_inputs,
             factorization_outputs,
             solve_inputs,
-        )
-    return jax.lax.cond(
-        _use_hard_state_only_nullspace_path(factorization_inputs),
-        lambda _: _hard_state_only_nullspace_solve(
-            factorization_inputs, solve_inputs, parallel=False
-        ),
-        lambda _: jax.lax.cond(
-            _use_hard_state_only_projected_path(factorization_inputs),
-            lambda __: _hard_state_only_projected_solve(
-                factorization_inputs, solve_inputs, parallel=False
-            ),
-            lambda __: _solve_generic(
-                factorization_inputs,
-                factorization_outputs,
-                solve_inputs,
-            ),
-            operand=None,
         ),
         operand=None,
     )
@@ -1219,30 +1105,15 @@ def solve_parallel(
     solve_inputs: SolveInputs,
 ) -> SolveOutputs:
     """Solve a constrained LQR RHS using the regularized KKT equations."""
-    p = factorization_inputs.D.shape[1]
-    n = factorization_inputs.A.shape[1]
-    if not (0 < p < n):
-        return _solve_parallel_generic(
+    return jax.lax.cond(
+        _use_hard_projected_path(factorization_inputs),
+        lambda _: _hard_projected_solve(
+            factorization_inputs, solve_inputs, parallel=True
+        ),
+        lambda _: _solve_parallel_generic(
             factorization_inputs,
             factorization_outputs,
             solve_inputs,
-        )
-    return jax.lax.cond(
-        _use_hard_state_only_nullspace_path(factorization_inputs),
-        lambda _: _hard_state_only_nullspace_solve(
-            factorization_inputs, solve_inputs, parallel=True
-        ),
-        lambda _: jax.lax.cond(
-            _use_hard_state_only_projected_path(factorization_inputs),
-            lambda __: _hard_state_only_projected_solve(
-                factorization_inputs, solve_inputs, parallel=True
-            ),
-            lambda __: _solve_parallel_generic(
-                factorization_inputs,
-                factorization_outputs,
-                solve_inputs,
-            ),
-            operand=None,
         ),
         operand=None,
     )
@@ -1274,25 +1145,12 @@ def factor_and_solve(
     solve_inputs: SolveInputs,
 ) -> SolveOutputs:
     """Sequential factor + solve; return the KKT point."""
-    p = factorization_inputs.D.shape[1]
-    n = factorization_inputs.A.shape[1]
-    if not (0 < p < n):
-        return _factor_and_solve_generic(factorization_inputs, solve_inputs)
     return jax.lax.cond(
-        _use_hard_state_only_nullspace_path(factorization_inputs),
-        lambda _: _hard_state_only_nullspace_solve(
+        _use_hard_projected_path(factorization_inputs),
+        lambda _: _hard_projected_solve(
             factorization_inputs, solve_inputs, parallel=False
         ),
-        lambda _: jax.lax.cond(
-            _use_hard_state_only_projected_path(factorization_inputs),
-            lambda __: _hard_state_only_projected_solve(
-                factorization_inputs, solve_inputs, parallel=False
-            ),
-            lambda __: _factor_and_solve_generic(
-                factorization_inputs, solve_inputs
-            ),
-            operand=None,
-        ),
+        lambda _: _factor_and_solve_generic(factorization_inputs, solve_inputs),
         operand=None,
     )
 
@@ -1317,26 +1175,13 @@ def factor_and_solve_parallel(
     solve_inputs: SolveInputs,
 ) -> SolveOutputs:
     """Parallel factor + solve; return the KKT point."""
-    p = factorization_inputs.D.shape[1]
-    n = factorization_inputs.A.shape[1]
-    if not (0 < p < n):
-        return _factor_and_solve_parallel_generic(
-            factorization_inputs, solve_inputs
-        )
     return jax.lax.cond(
-        _use_hard_state_only_nullspace_path(factorization_inputs),
-        lambda _: _hard_state_only_nullspace_solve(
+        _use_hard_projected_path(factorization_inputs),
+        lambda _: _hard_projected_solve(
             factorization_inputs, solve_inputs, parallel=True
         ),
-        lambda _: jax.lax.cond(
-            _use_hard_state_only_projected_path(factorization_inputs),
-            lambda __: _hard_state_only_projected_solve(
-                factorization_inputs, solve_inputs, parallel=True
-            ),
-            lambda __: _factor_and_solve_parallel_generic(
-                factorization_inputs, solve_inputs
-            ),
-            operand=None,
+        lambda _: _factor_and_solve_parallel_generic(
+            factorization_inputs, solve_inputs
         ),
         operand=None,
     )

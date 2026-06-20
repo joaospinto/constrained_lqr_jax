@@ -11,11 +11,10 @@ The parallel backward pass is built on the *mixed-constraint interval value
 function* (IVF) — a uniform, fixed-dimension representation of the cost-to-go of
 an interval ``[i, j)`` that **carries the constraint** instead of eliminating
 its multiplier at the base case.  It supports the generic scan path for mixed
-constraints, rank-deficient ``E``, ``p > m`` and the unconstrained case.  The
-solver adds a separate nullspace-coordinate path for full-row-rank hard
-state-only constraints, whose suffix feasibility domains can exceed this IVF
-carrier.  The construction mirrors ``MixedConstraintIVF`` in the Lean
-formalization (see ``MIXED_CONSTRAINT_ANALYSIS.md``).
+constraints, regularized constraints, and unconstrained problems.  Hard
+state-only cases with more constraints than controls use an endpoint-domain scan
+before the mixed-IVF solve so suffix feasibility domains are represented
+explicitly.
 
 A mixed IVF over an interval with entry state ``x`` and exit state ``x'`` is the
 9-component object ``(P, p, A, C, c, Cyl, Cll, F, g)`` representing

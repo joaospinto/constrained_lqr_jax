@@ -17,7 +17,7 @@ from constrained_lqr_jax.solver import (
     _block_tridiag_factor,
     _block_tridiag_solve,
     _block_tridiag_solve_from_factor,
-    _state_only_suffix_domains_parallel,
+    _suffix_domains_parallel,
 )
 from constrained_lqr_jax.types import FactorizationInputs, SolveInputs
 from test.test_solver import dense_primal, make_problem
@@ -349,7 +349,7 @@ def test_parallel_solver_large_structured_dual_recovery_has_small_kkt_residual(
     )
 
 
-def test_separate_factor_and_solve_matches_hard_state_only_nullspace_path():
+def test_separate_factor_and_solve_matches_hard_projected_path():
     N, n, m, p, emode, regularized = 32, 8, 3, 5, "zero", False
     fac, si = make_problem(
         _seed(N, n, m, p, emode, regularized),
@@ -375,7 +375,7 @@ def test_separate_factor_and_solve_matches_hard_state_only_nullspace_path():
         assert error / scale < 1e-12
 
 
-def test_state_only_suffix_domain_scan_captures_full_viability_rank():
+def test_suffix_domain_scan_captures_full_viability_rank():
     N, n, m, p, emode, regularized = 32, 8, 3, 5, "zero", False
     fac, si = make_problem(
         _seed(N, n, m, p, emode, regularized),
@@ -388,14 +388,14 @@ def test_state_only_suffix_domain_scan_captures_full_viability_rank():
     )
     sol = factor_and_solve_parallel(fac, si)
 
-    H, h = _state_only_suffix_domains_parallel(fac, si)
+    H, h = _suffix_domains_parallel(fac, si)
     residual = jax.vmap(lambda Hk, hk, xk: Hk @ xk - hk)(H, h, sol.X)
 
     assert np.linalg.matrix_rank(np.array(H[1]), tol=1e-8) == n
     assert _max_abs(residual) / _scale(H, h, sol.X) < 1e-10
 
 
-def test_state_only_suffix_domain_scan_handles_rank_deficient_rows():
+def test_suffix_domain_scan_handles_rank_deficient_rows():
     N, n, m, p, emode, regularized = 16, 6, 2, 4, "zero", False
     fac, si = make_problem(
         _seed(N, n, m, p, emode, regularized),
@@ -422,7 +422,7 @@ def test_state_only_suffix_domain_scan_handles_rank_deficient_rows():
     rank_def_si = SolveInputs(q=si.q, r=si.r, c=si.c, d=d)
     xd, _ = dense_primal(rank_def_fac, rank_def_si)
 
-    H, h = _state_only_suffix_domains_parallel(rank_def_fac, rank_def_si)
+    H, h = _suffix_domains_parallel(rank_def_fac, rank_def_si)
     residual = jax.vmap(lambda Hk, hk, xk: Hk @ xk - hk)(
         H, h, jnp.array(xd)
     )
@@ -469,7 +469,7 @@ def test_parallel_solver_matches_dense_with_inactive_terminal_constraints():
 
 
 @pytest.mark.parametrize("N", [8, 16, 32, 64])
-def test_rank_deficient_hard_state_only_projected_path_matches_dense(N):
+def test_rank_deficient_hard_projected_path_matches_dense(N):
     n, m, p, emode, regularized = 8, 3, 5, "zero", False
     fac, si = make_problem(
         _seed(N, n, m, p, emode, regularized),

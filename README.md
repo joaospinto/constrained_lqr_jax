@@ -68,15 +68,16 @@ The parallel solve has three phases.
    about half, then a top-down recovery reconstructs all eliminated costates.
    Equality multipliers are recovered independently per stage afterward.
 
-Hard state-only constraints with `E_k = 0`, `Delta_k = 0`, and `Sigma_k = 0`
-use a reduced-coordinate path before the three phases above.  If the state
-constraint rows have full row rank, each constrained state is represented as
-`x_k = xbar_k + Z_k z_k` in a nullspace basis.  If the rows are rank deficient,
-an associative endpoint-domain scan first computes the exact suffix feasibility
-domain `H_k x_k = h_k`, then the problem is projected onto that domain.  In
-both cases, the transformed problem is solved by the same scan-based LQR
+Hard state-only constraints with more constraints than controls use an
+endpoint-domain projection before the three phases above.  Each stage is first
+converted to a linear endpoint relation
+`H_left,k x_k + H_right,k x_{k+1} = h_k` describing the states for which some
+control satisfies both dynamics and stage constraints.  An associative scan
+combines these relations into suffix feasibility domains `H_k x_k = h_k`; the
+solver then writes `x_k = xbar_k + P_k z_k`, where `P_k` projects onto the
+domain nullspace.  The transformed problem is solved by the same scan-based LQR
 machinery and the original multipliers are recovered by the structured dual
-pass.
+pass.  Other hard and regularized cases use the mixed-IVF scan path directly.
 
 `factor_parallel(inputs)` builds RHS-independent data: zero-RHS cost-to-go
 feedback matrices and the dual-recovery block-tridiagonal factorization.
